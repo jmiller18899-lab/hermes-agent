@@ -267,6 +267,21 @@ class TestExtractReasoning:
         result = agent._extract_reasoning(msg)
         assert result == "same text"
 
+    @pytest.mark.parametrize(
+        ("content", "expected"),
+        [
+            ("<think>thinking hard</think>", "thinking hard"),
+            ("<thinking>step by step</thinking>", "step by step"),
+            (
+                "<REASONING_SCRATCHPAD>scratch analysis</REASONING_SCRATCHPAD>",
+                "scratch analysis",
+            ),
+        ],
+    )
+    def test_inline_reasoning_blocks_fallback(self, agent, content, expected):
+        msg = _mock_assistant_msg(content=content)
+        assert agent._extract_reasoning(msg) == expected
+
 
 class TestCleanSessionContent:
     def test_none_passthrough(self):
@@ -568,6 +583,38 @@ class TestBuildSystemPrompt:
         prompt = agent._build_system_prompt()
         # Should contain current date info like "Conversation started:"
         assert "Conversation started:" in prompt
+
+    def test_skills_prompt_derives_available_toolsets_from_loaded_tools(self):
+        tools = _make_tool_defs("web_search", "skills_list", "skill_view", "skill_manage")
+        toolset_map = {
+            "web_search": "web",
+            "skills_list": "skills",
+            "skill_view": "skills",
+            "skill_manage": "skills",
+        }
+
+        with (
+            patch("run_agent.get_tool_definitions", return_value=tools),
+            patch(
+                "run_agent.check_toolset_requirements",
+                side_effect=AssertionError("should not re-check toolset requirements"),
+            ),
+            patch("run_agent.get_toolset_for_tool", create=True, side_effect=toolset_map.get),
+            patch("run_agent.build_skills_system_prompt", return_value="SKILLS_PROMPT") as mock_skills,
+            patch("run_agent.OpenAI"),
+        ):
+            agent = AIAgent(
+                api_key="test-k...7890",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+
+            prompt = agent._build_system_prompt()
+
+        assert "SKILLS_PROMPT" in prompt
+        assert mock_skills.call_args.kwargs["available_tools"] == set(toolset_map)
+        assert mock_skills.call_args.kwargs["available_toolsets"] == {"web", "skills"}
 
 
 class TestInvalidateSystemPrompt:
@@ -1202,8 +1249,8 @@ class TestRunConversation:
         assert result["completed"] is True
         assert result["api_calls"] == 2
 
-    def test_empty_content_retry_and_fallback(self, agent):
-        """Empty content (only think block) retries, then falls back to partial."""
+    def test_empty_content_retry_uses_inline_reasoning_as_response(self, agent):
+        """Reasoning-only payloads should recover the inline reasoning text."""
         self._setup_agent(agent)
         empty_resp = _mock_response(
             content="<think>internal reasoning</think>",
@@ -1221,9 +1268,8 @@ class TestRunConversation:
             patch.object(agent, "_cleanup_task_resources"),
         ):
             result = agent.run_conversation("answer me")
-        # After 3 retries with no real content, should return partial
-        assert result["completed"] is False
-        assert result.get("partial") is True
+        assert result["completed"] is True
+        assert result["final_response"] == "internal reasoning"
 
     def test_nous_401_refreshes_after_remint_and_retries(self, agent):
         self._setup_agent(agent)
@@ -1294,6 +1340,36 @@ class TestRunConversation:
             result = agent.run_conversation("search something")
         mock_compress.assert_called_once()
         assert result["final_response"] == "All done"
+        assert result["completed"] is True
+
+    def test_glm_prompt_exceeds_max_length_triggers_compression(self, agent):
+        """GLM/Z.AI uses 'Prompt exceeds max length' for context overflow."""
+        self._setup_agent(agent)
+        err_400 = Exception(
+            "Error code: 400 - {'error': {'code': '1261', 'message': 'Prompt exceeds max length'}}"
+        )
+        err_400.status_code = 400
+        ok_resp = _mock_response(content="Recovered after compression", finish_reason="stop")
+        agent.client.chat.completions.create.side_effect = [err_400, ok_resp]
+        prefill = [
+            {"role": "user", "content": "previous question"},
+            {"role": "assistant", "content": "previous answer"},
+        ]
+
+        with (
+            patch.object(agent, "_compress_context") as mock_compress,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            mock_compress.return_value = (
+                [{"role": "user", "content": "hello"}],
+                "compressed system prompt",
+            )
+            result = agent.run_conversation("hello", conversation_history=prefill)
+
+        mock_compress.assert_called_once()
+        assert result["final_response"] == "Recovered after compression"
         assert result["completed"] is True
 
     @pytest.mark.parametrize(
@@ -1381,8 +1457,8 @@ class TestRetryExhaustion:
         assert "error" in result
         assert "Invalid API response" in result["error"]
 
-    def test_api_error_raises_after_retries(self, agent):
-        """Exhausted retries on API errors must raise, not fall through."""
+    def test_api_error_returns_gracefully_after_retries(self, agent):
+        """Exhausted retries on API errors must return error result, not crash."""
         self._setup_agent(agent)
         agent.client.chat.completions.create.side_effect = RuntimeError("rate limited")
         with (
@@ -1391,8 +1467,11 @@ class TestRetryExhaustion:
             patch.object(agent, "_cleanup_task_resources"),
             patch("run_agent.time", self._make_fast_time_mock()),
         ):
-            with pytest.raises(RuntimeError, match="rate limited"):
-                agent.run_conversation("hello")
+            result = agent.run_conversation("hello")
+        assert result.get("completed") is False
+        assert result.get("failed") is True
+        assert "error" in result
+        assert "rate limited" in result["error"]
 
 
 # ---------------------------------------------------------------------------
