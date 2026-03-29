@@ -1,142 +1,95 @@
 'use strict';
 
-const express = require('express');
+const http = require('http');
 const { spawn } = require('child_process');
-const app = express();
+
 const PORT = process.env.PORT || 8080;
 
-app.use(express.json());
+function sendJSON(res, status, body) {
+  const data = JSON.stringify(body);
+  res.writeHead(status, {
+    'Content-Type': 'application/json',
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+  });
+  res.end(data);
+}
 
-// CORS — allow NullClaw and any frontend to call this
-app.use((req, res, next) => {
-  res.header('Access-Control-Allow-Origin', '*');
-  res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-  if (req.method === 'OPTIONS') return res.sendStatus(200);
-  next();
-});
-
-// Health check
-app.get('/', (req, res) => res.json({ status: 'ok', service: 'hermes-agent' }));
-app.get('/health', (req, res) => res.json({ status: 'ok' }));
-
-/**
- * OpenAI-compatible chat completions endpoint.
- * Accepts: { model, messages: [{role, content}], stream? }
- * Returns: OpenAI-format response or SSE stream
- */
-app.post('/v1/chat/completions', async (req, res) => {
-  const { messages = [], stream = false, model } = req.body;
-
-  // Extract the last user message as the prompt
-  const userMessages = messages.filter(m => m.role === 'user');
-  const lastUser = userMessages[userMessages.length - 1];
-  if (!lastUser) {
-    return res.status(400).json({ error: 'No user message found' });
+const server = http.createServer((req, res) => {
+  // CORS preflight
+  if (req.method === 'OPTIONS') {
+    res.writeHead(200, {
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+    });
+    return res.end();
   }
 
-  const prompt = typeof lastUser.content === 'string'
-    ? lastUser.content
-    : lastUser.content.map(c => c.text || '').join(' ');
+  // Health check
+  if (req.method === 'GET' && (req.url === '/' || req.url === '/health')) {
+    return sendJSON(res, 200, { status: 'ok', service: 'hermes-agent' });
+  }
 
-  // Build system prompt from messages
-  const systemMsg = messages.find(m => m.role === 'system');
-  const systemPrompt = systemMsg ? systemMsg.content : '';
+  // Chat completions
+  if (req.method === 'POST' && (req.url === '/v1/chat/completions' || req.url === '/api/chat')) {
+    let body = '';
+    req.on('data', chunk => { body += chunk; });
+    req.on('end', () => {
+      let payload;
+      try { payload = JSON.parse(body); } catch (e) {
+        return sendJSON(res, 400, { error: 'Invalid JSON' });
+      }
 
-  // Spawn hermes Python agent
-  const args = ['run_agent.py', '--message', prompt, '--no-interactive'];
-  if (systemPrompt) args.push('--system', systemPrompt);
-  if (model) args.push('--model', model);
+      const messages = payload.messages || [];
+      const userMsgs = messages.filter(m => m.role === 'user');
+      const last = userMsgs[userMsgs.length - 1];
+      if (!last) return sendJSON(res, 400, { error: 'No user message' });
 
-  const env = {
-    ...process.env,
-    HERMES_QUIET: '1',
-    PYTHONUNBUFFERED: '1',
-  };
+      const prompt = typeof last.content === 'string'
+        ? last.content
+        : (last.content || []).map(c => c.text || '').join(' ');
 
-  const child = spawn('python', args, { env, cwd: '/app' });
+      const systemMsg = messages.find(m => m.role === 'system');
+      const args = ['run_agent.py', '--message', prompt, '--no-interactive'];
+      if (systemMsg) args.push('--system', systemMsg.content);
 
-  let output = '';
-  let errorOutput = '';
-
-  child.stdout.on('data', d => { output += d.toString(); });
-  child.stderr.on('data', d => { errorOutput += d.toString(); });
-
-  child.on('close', (code) => {
-    // Clean up ANSI codes and control characters from output
-    const cleaned = output
-      .replace(/\x1b\[[0-9;]*m/g, '')   // ANSI colors
-      .replace(/\x1b\[[0-9;]*[A-Za-z]/g, '') // other escape sequences
-      .trim();
-
-    const responseText = cleaned || (code !== 0
-      ? `Error running agent (exit ${code}): ${errorOutput.slice(0, 200)}`
-      : 'No response');
-
-    if (stream) {
-      // SSE streaming format
-      res.setHeader('Content-Type', 'text/event-stream');
-      res.setHeader('Cache-Control', 'no-cache');
-      res.setHeader('Connection', 'keep-alive');
-
-      const chunk = {
-        id: `chatcmpl-${Date.now()}`,
-        object: 'chat.completion.chunk',
-        created: Math.floor(Date.now() / 1000),
-        model: model || 'hermes-agent',
-        choices: [{
-          index: 0,
-          delta: { role: 'assistant', content: responseText },
-          finish_reason: null,
-        }],
-      };
-      res.write(`data: ${JSON.stringify(chunk)}\n\n`);
-
-      const done = {
-        ...chunk,
-        choices: [{ ...chunk.choices[0], delta: {}, finish_reason: 'stop' }],
-      };
-      res.write(`data: ${JSON.stringify(done)}\n\n`);
-      res.write('data: [DONE]\n\n');
-      res.end();
-    } else {
-      // Standard JSON response
-      res.json({
-        id: `chatcmpl-${Date.now()}`,
-        object: 'chat.completion',
-        created: Math.floor(Date.now() / 1000),
-        model: model || 'hermes-agent',
-        choices: [{
-          index: 0,
-          message: { role: 'assistant', content: responseText },
-          finish_reason: 'stop',
-        }],
-        usage: {
-          prompt_tokens: prompt.length,
-          completion_tokens: responseText.length,
-          total_tokens: prompt.length + responseText.length,
-        },
+      const child = spawn('python', args, {
+        cwd: '/app',
+        env: { ...process.env, HERMES_QUIET: '1', PYTHONUNBUFFERED: '1' },
       });
-    }
-  });
 
-  // Timeout after 90s
-  setTimeout(() => {
-    if (!res.headersSent) {
-      child.kill();
-      res.status(504).json({ error: 'Agent timed out after 90s' });
-    }
-  }, 90000);
+      let out = '', err = '';
+      child.stdout.on('data', d => { out += d; });
+      child.stderr.on('data', d => { err += d; });
+
+      const timer = setTimeout(() => {
+        child.kill();
+        if (!res.headersSent) sendJSON(res, 504, { error: 'Agent timed out' });
+      }, 90000);
+
+      child.on('close', () => {
+        clearTimeout(timer);
+        if (res.headersSent) return;
+        const text = out.replace(/\x1b\[[0-9;]*[mA-Za-z]/g, '').trim()
+          || (err ? `Error: ${err.slice(0, 200)}` : 'No response');
+        sendJSON(res, 200, {
+          id: `chatcmpl-${Date.now()}`,
+          object: 'chat.completion',
+          created: Math.floor(Date.now() / 1000),
+          model: payload.model || 'hermes-agent',
+          choices: [{ index: 0, message: { role: 'assistant', content: text }, finish_reason: 'stop' }],
+          usage: { prompt_tokens: prompt.length, completion_tokens: text.length, total_tokens: prompt.length + text.length },
+        });
+      });
+    });
+    return;
+  }
+
+  sendJSON(res, 404, { error: 'Not found' });
 });
 
-// Also support the IronClaw-style gateway endpoint NullClaw uses
-app.post('/api/chat', (req, res) => {
-  req.body.messages = req.body.messages || [{ role: 'user', content: req.body.message || '' }];
-  req.url = '/v1/chat/completions';
-  app._router.handle(req, res);
-});
-
-app.listen(PORT, () => {
-  console.log(`Hermes Agent HTTP Gateway running on port ${PORT}`);
-  console.log(`Endpoints: POST /v1/chat/completions, GET /health`);
+server.listen(PORT, () => {
+  console.log(`Hermes Agent gateway running on port ${PORT}`);
 });
