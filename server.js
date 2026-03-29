@@ -73,7 +73,7 @@ try:
         enabled_toolsets=['core', 'files', 'terminal'],
     )
     agent._print_fn = lambda *a, **kw: None
-    result = agent.run(${JSON.stringify(prompt)})
+    result = agent.chat(${JSON.stringify(prompt)})
     print(result if result else 'Done.')
 except Exception as e:
     print(f'Error: {e}')
