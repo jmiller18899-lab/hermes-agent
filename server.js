@@ -80,7 +80,7 @@ try:
         base_url=runtime.get('base_url'),
         provider=runtime.get('provider'),
         api_mode=runtime.get('api_mode'),
-        max_iterations=8,
+        max_iterations=20,
         quiet_mode=True,
         session_id=${JSON.stringify(sessionId)},
         enabled_toolsets=['core', 'files', 'terminal', 'memory'],
@@ -195,7 +195,7 @@ const server = http.createServer((req, res) => {
             usage: { prompt_tokens: prompt.length, completion_tokens: text.length, total_tokens: prompt.length + text.length },
           }));
         }
-      }, 120000);
+      }, 300000);
 
       child.on('close', () => {
         clearTimeout(timer);
@@ -233,7 +233,7 @@ const server = http.createServer((req, res) => {
   sendJSON(res, 404, { error: 'Not found' });
 });
 
-server.timeout = 180000;
+server.timeout = 360000;
 server.listen(PORT, () => {
   console.log(`Hermes Agent gateway v4 running on port ${PORT}`);
   console.log(`Memory: in-session history + Hermes native memory tool enabled`);
