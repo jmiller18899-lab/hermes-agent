@@ -35,24 +35,29 @@ function sendJSON(res, status, body) {
 }
 
 function cleanOutput(raw) {
-  // Strip Hermes debug/startup lines, keep only the actual reply
-  const skip = [
-    'AI Agent initialized', 'Tool selection', 'Making API call', 'API call',
-    'CONVERSATION SUMMARY', 'Completed:', 'Agent execution', 'Prompt caching',
-    'Context limit', 'Available tools', 'Loaded', 'Request size', 'Elapsed',
-    'Provider:', 'Endpoint:', 'Error details', 'Using API key', 'Using custom base',
-    'Final tool', 'Some tools', 'User Query:', 'Starting conversation',
-    'Context window', 'compress at',
-  ];
-  return raw.split('\n')
-    .filter(line => {
-      if (/^[🤖🔗🔑🛠️📊💾⚠️❌✅👋🔄📝💬📞🔌🌐💡📋🔄💻🧠📈🔍⏱️🎯🔀]/.test(line)) return false;
-      if (line.startsWith('===') || line.startsWith('---') || line.startsWith('>>>')) return false;
-      if (skip.some(s => line.includes(s))) return false;
-      return true;
-    })
-    .join('\n')
-    .trim();
+  // Find where the actual agent reply starts — after the last === header block
+  const lines = raw.split("\n");
+  
+  // Find the last occurrence of a === divider — reply comes after it
+  let lastDivider = -1;
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i].startsWith("===")) lastDivider = i;
+  }
+  
+  // Take everything after the last divider block
+  let replyLines = lastDivider >= 0 ? lines.slice(lastDivider + 1) : lines;
+  
+  // Strip trailing summary block (CONVERSATION SUMMARY onwards)
+  let summaryIdx = replyLines.findIndex(l => l.includes("CONVERSATION SUMMARY"));
+  if (summaryIdx >= 0) replyLines = replyLines.slice(0, summaryIdx);
+  
+  // Strip leading/trailing blank lines and emoji-only status lines
+  replyLines = replyLines.filter((l, i) => {
+    if (/^[🤖🔄⏱️💾]/.test(l.trim()) && l.trim().length < 60) return false;
+    return true;
+  });
+  
+  return replyLines.join("\n").trim() || raw.trim();
 }
 
 function buildPythonScript(prompt, history, sessionId) {
