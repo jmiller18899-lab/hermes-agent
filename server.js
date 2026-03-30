@@ -100,10 +100,17 @@ try:
         agent.conversation_history = history
 
     result = agent.chat(${JSON.stringify(prompt)})
-    print(result if result else 'Done.')
+    if result and result.strip():
+        sys.stdout.write(result)
+        sys.stdout.flush()
+    else:
+        sys.stdout.write('(no response)')
+        sys.stdout.flush()
 except Exception as e:
     import traceback
-    print(f'Error: {e}')
+    tb = traceback.format_exc()
+    sys.stdout.write(f'Error: {e}\n{tb}')
+    sys.stdout.flush()
 `;
 }
 
