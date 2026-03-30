@@ -1,4 +1,3 @@
-
 import sys, os, json as _json
 sys.path.insert(0, '/app')
 os.environ['HERMES_QUIET'] = '1'
@@ -23,9 +22,21 @@ try:
         api_mode=runtime.get('api_mode'),
         max_iterations=20,
         quiet_mode=False,
+        max_tokens=4096,
         enabled_toolsets=['core', 'files', 'terminal', 'memory'],
     )
     agent._print_fn = lambda *a, **kw: None
+
+    # Restore conversation history
+    try:
+        hist = _json.loads(args.history)
+        for attr in ['_conversation_history', 'conversation_history', 'messages']:
+            if hasattr(agent, attr):
+                setattr(agent, attr, hist)
+                break
+    except Exception:
+        pass
+
     result = agent.run_conversation(args.prompt)
     if isinstance(result, dict):
         text = result.get('final_response') or result.get('response') or repr(result)
