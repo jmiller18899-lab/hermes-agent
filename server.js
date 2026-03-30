@@ -1,27 +1,24 @@
 'use strict';
 
 /**
- * Hermes Agent HTTP Gateway v4
- * - In-session memory: conversation history carried per session ID
- * - Cross-session memory: Hermes native memory tool enabled, persists to /data/.hermes/
- * - Session cache: agent instance reused per session (preserves context)
+ * Hermes Agent HTTP Gateway v6
+ * Writes result to a temp file to bypass quiet_mode stdout suppression.
  */
 
 const http = require('http');
 const { spawn } = require('child_process');
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
+
 const PORT = process.env.PORT || 8080;
 
-// In-memory session store: sessionId → { history: [], lastActive: Date }
+// Session store: sessionId -> { history: [{role,content}], lastActive }
 const sessions = new Map();
-const SESSION_TTL_MS = 60 * 60 * 1000; // 1 hour
-
-// Clean up stale sessions every 15 minutes
 setInterval(() => {
-  const now = Date.now();
-  for (const [id, s] of sessions) {
-    if (now - s.lastActive > SESSION_TTL_MS) sessions.delete(id);
-  }
-}, 15 * 60 * 1000);
+  const cutoff = Date.now() - 3600000;
+  for (const [id, s] of sessions) if (s.lastActive < cutoff) sessions.delete(id);
+}, 900000);
 
 function sendJSON(res, status, body) {
   const data = JSON.stringify(body);
@@ -34,63 +31,15 @@ function sendJSON(res, status, body) {
   res.end(data);
 }
 
-function cleanOutput(raw) {
-  // chat() already returns the clean reply — just trim whitespace
-  return raw.trim();
-}
-
-function buildPythonScript(prompt, history, sessionId) {
-  // Build conversation history as Python list literal
-  const historyJson = JSON.stringify(history);
-  const sessionDir = `/data/.hermes/sessions`;
-
-  return `
-import sys, os, json
-sys.path.insert(0, '/app')
-os.environ['HERMES_QUIET'] = '1'
-os.environ['PYTHONUNBUFFERED'] = '1'
-os.environ['HOME'] = '/data'
-
-# Ensure session dir exists
-os.makedirs('${sessionDir}', exist_ok=True)
-
-from run_agent import AIAgent
-from hermes_cli.runtime_provider import resolve_runtime_provider
-
-try:
-    runtime = resolve_runtime_provider()
-    agent = AIAgent(
-        api_key=runtime.get('api_key'),
-        base_url=runtime.get('base_url'),
-        provider=runtime.get('provider'),
-        api_mode=runtime.get('api_mode'),
-        max_iterations=20,
-        quiet_mode=True,
-        session_id=${JSON.stringify(sessionId)},
-        enabled_toolsets=['core', 'files', 'terminal', 'memory'],
-    )
-    agent._print_fn = lambda *a, **kw: None
-
-    # Restore conversation history into agent
-    history = json.loads(${JSON.stringify(historyJson)})
-    if hasattr(agent, '_conversation_history'):
-        agent._conversation_history = history
-    elif hasattr(agent, 'conversation_history'):
-        agent.conversation_history = history
-
-    result = agent.chat(${JSON.stringify(prompt)})
-    if result and result.strip():
-        sys.stdout.write(result)
-        sys.stdout.flush()
-    else:
-        sys.stdout.write('(no response)')
-        sys.stdout.flush()
-except Exception as e:
-    import traceback
-    tb = traceback.format_exc()
-    sys.stdout.write(f'Error: {e}\n{tb}')
-    sys.stdout.flush()
-`;
+function makeReply(content, model) {
+  return {
+    id: 'chatcmpl-' + Date.now(),
+    object: 'chat.completion',
+    created: Math.floor(Date.now() / 1000),
+    model: model || 'hermes-agent',
+    choices: [{ index: 0, message: { role: 'assistant', content }, finish_reason: 'stop' }],
+    usage: { prompt_tokens: 0, completion_tokens: content.length, total_tokens: content.length },
+  };
 }
 
 const server = http.createServer((req, res) => {
@@ -104,35 +53,17 @@ const server = http.createServer((req, res) => {
   }
 
   if (req.method === 'GET' && (req.url === '/' || req.url === '/health')) {
-    return sendJSON(res, 200, {
-      status: 'ok',
-      service: 'hermes-agent',
-      sessions: sessions.size,
-    });
+    return sendJSON(res, 200, { status: 'ok', service: 'hermes-agent', sessions: sessions.size });
   }
 
   if (req.method === 'POST' && (req.url === '/v1/chat/completions' || req.url === '/api/chat')) {
     let body = '';
-    req.on('data', chunk => { body += chunk; });
+    req.on('data', d => { body += d; });
     req.on('end', () => {
       let payload;
-      try { payload = JSON.parse(body); } catch {
-        return sendJSON(res, 400, { error: 'Invalid JSON' });
-      }
+      try { payload = JSON.parse(body); } catch { return sendJSON(res, 400, { error: 'Invalid JSON' }); }
 
       const messages = payload.messages || [];
-
-      // Extract session ID from header or generate from message count (NullClaw sends full history)
-      const sessionId = req.headers['x-session-id'] || `nullclaw-${messages.length}`;
-
-      // Get or create session
-      if (!sessions.has(sessionId)) {
-        sessions.set(sessionId, { history: [], lastActive: Date.now() });
-      }
-      const session = sessions.get(sessionId);
-      session.lastActive = Date.now();
-
-      // Extract the latest user message
       const userMsgs = messages.filter(m => m.role === 'user');
       const last = userMsgs[userMsgs.length - 1];
       if (!last) return sendJSON(res, 400, { error: 'No user message' });
@@ -141,23 +72,72 @@ const server = http.createServer((req, res) => {
         ? last.content
         : (last.content || []).map(c => c.text || '').join(' ');
 
-      // Build history from full message array (NullClaw sends all messages)
-      // Use all messages except the last user one (agent will add that)
-      const historyForAgent = messages.slice(0, -1).map(m => ({
+      // Session history
+      const sessionId = req.headers['x-session-id'] || ('s' + messages.length);
+      if (!sessions.has(sessionId)) sessions.set(sessionId, { history: [], lastActive: Date.now() });
+      const session = sessions.get(sessionId);
+      session.lastActive = Date.now();
+
+      const history = messages.slice(0, -1).map(m => ({
         role: m.role,
         content: typeof m.content === 'string' ? m.content : (m.content || []).map(c => c.text || '').join(''),
       }));
 
-      const script = buildPythonScript(prompt, historyForAgent, sessionId);
+      // Write result to temp file — avoids quiet_mode stdout suppression
+      const outFile = path.join(os.tmpdir(), 'hermes_' + Date.now() + '_' + Math.random().toString(36).slice(2) + '.txt');
+      const historyFile = path.join(os.tmpdir(), 'hermes_hist_' + Date.now() + '.json');
+      fs.writeFileSync(historyFile, JSON.stringify(history));
 
-      const child = spawn('python', ['-c', script], {
+      const pyScript = `
+import sys, os, json
+sys.path.insert(0, '/app')
+os.environ['HERMES_QUIET'] = '1'
+os.environ['PYTHONUNBUFFERED'] = '1'
+os.environ['HOME'] = '/data'
+os.makedirs('/data/.hermes', exist_ok=True)
+
+outfile = ${JSON.stringify(outFile)}
+histfile = ${JSON.stringify(historyFile)}
+prompt = ${JSON.stringify(prompt)}
+
+try:
+    import json as _json
+    from run_agent import AIAgent
+    from hermes_cli.runtime_provider import resolve_runtime_provider
+
+    runtime = resolve_runtime_provider()
+    agent = AIAgent(
+        api_key=runtime.get('api_key'),
+        base_url=runtime.get('base_url'),
+        provider=runtime.get('provider'),
+        api_mode=runtime.get('api_mode'),
+        max_iterations=20,
+        quiet_mode=True,
+        enabled_toolsets=['core', 'files', 'terminal', 'memory'],
+    )
+    agent._print_fn = lambda *a, **kw: None
+
+    # Restore history
+    with open(histfile) as f:
+        hist = _json.load(f)
+    for attr in ['_conversation_history', 'conversation_history', 'messages']:
+        if hasattr(agent, attr):
+            setattr(agent, attr, hist)
+            break
+
+    result = agent.chat(prompt)
+    text = result if (result and result.strip()) else '(no response)'
+    with open(outfile, 'w') as f:
+        f.write(text)
+except Exception as e:
+    import traceback
+    with open(outfile, 'w') as f:
+        f.write('Error: ' + str(e))
+`;
+
+      const child = spawn('python', ['-c', pyScript], {
         cwd: '/app',
-        env: {
-          ...process.env,
-          HERMES_QUIET: '1',
-          PYTHONUNBUFFERED: '1',
-          HOME: '/data',
-        },
+        env: { ...process.env, HERMES_QUIET: '1', PYTHONUNBUFFERED: '1', HOME: '/data' },
       });
 
       res.writeHead(200, {
@@ -166,25 +146,17 @@ const server = http.createServer((req, res) => {
         'Transfer-Encoding': 'chunked',
       });
 
-      let out = '', err = '';
-      child.stdout.on('data', d => { out += d.toString(); });
-      child.stderr.on('data', d => { err += d.toString(); });
-
+      let stderr = '';
+      child.stderr.on('data', d => { stderr += d; });
       const keepAlive = setInterval(() => { try { res.write(''); } catch {} }, 10000);
 
       const timer = setTimeout(() => {
         clearInterval(keepAlive);
         child.kill();
         if (!res.writableEnded) {
-          const text = cleanOutput(out) || 'Agent timed out — try a shorter question.';
-          res.end(JSON.stringify({
-            id: `chatcmpl-${Date.now()}`,
-            object: 'chat.completion',
-            created: Math.floor(Date.now() / 1000),
-            model: payload.model || 'hermes-agent',
-            choices: [{ index: 0, message: { role: 'assistant', content: text }, finish_reason: 'stop' }],
-            usage: { prompt_tokens: prompt.length, completion_tokens: text.length, total_tokens: prompt.length + text.length },
-          }));
+          let text = 'Agent timed out (5 min). Try a shorter request.';
+          try { if (fs.existsSync(outFile)) text = fs.readFileSync(outFile, 'utf8').trim() || text; } catch {}
+          res.end(JSON.stringify(makeReply(text, payload.model)));
         }
       }, 300000);
 
@@ -193,39 +165,30 @@ const server = http.createServer((req, res) => {
         clearInterval(keepAlive);
         if (res.writableEnded) return;
 
-        const text = cleanOutput(out) || (err ? `Error: ${err.slice(0, 300)}` : 'No response');
+        let text = '';
+        try {
+          if (fs.existsSync(outFile)) {
+            text = fs.readFileSync(outFile, 'utf8').trim();
+            fs.unlinkSync(outFile);
+          }
+        } catch {}
+        try { fs.unlinkSync(historyFile); } catch {}
 
-        // Update session history
+        if (!text) text = stderr ? 'Error: ' + stderr.slice(0, 300) : '(no response from agent)';
+
+        // Update session
         session.history.push({ role: 'user', content: prompt });
         session.history.push({ role: 'assistant', content: text });
-        // Keep last 40 messages (20 turns)
         if (session.history.length > 40) session.history = session.history.slice(-40);
 
-        res.end(JSON.stringify({
-          id: `chatcmpl-${Date.now()}`,
-          object: 'chat.completion',
-          created: Math.floor(Date.now() / 1000),
-          model: payload.model || 'hermes-agent',
-          choices: [{ index: 0, message: { role: 'assistant', content: text }, finish_reason: 'stop' }],
-          usage: { prompt_tokens: prompt.length, completion_tokens: text.length, total_tokens: prompt.length + text.length },
-        }));
+        res.end(JSON.stringify(makeReply(text, payload.model)));
       });
     });
     return;
-  }
-
-  // Clear session endpoint
-  if (req.method === 'POST' && req.url === '/session/clear') {
-    const sessionId = req.headers['x-session-id'];
-    if (sessionId && sessions.has(sessionId)) sessions.delete(sessionId);
-    return sendJSON(res, 200, { ok: true });
   }
 
   sendJSON(res, 404, { error: 'Not found' });
 });
 
 server.timeout = 360000;
-server.listen(PORT, () => {
-  console.log(`Hermes Agent gateway v4 running on port ${PORT}`);
-  console.log(`Memory: in-session history + Hermes native memory tool enabled`);
-});
+server.listen(PORT, () => console.log('Hermes gateway v6 on port ' + PORT));
