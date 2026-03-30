@@ -112,21 +112,16 @@ try:
         provider=runtime.get('provider'),
         api_mode=runtime.get('api_mode'),
         max_iterations=20,
-        quiet_mode=True,
+        quiet_mode=False,
         enabled_toolsets=['core', 'files', 'terminal', 'memory'],
     )
+    # Silence all print output — we only want the return value
+    import io
     agent._print_fn = lambda *a, **kw: None
 
-    # Restore history
-    with open(histfile) as f:
-        hist = _json.load(f)
-    for attr in ['_conversation_history', 'conversation_history', 'messages']:
-        if hasattr(agent, attr):
-            setattr(agent, attr, hist)
-            break
-
-    result = agent.chat(prompt)
-    text = result if (result and result.strip()) else '(no response)'
+    result = agent.run_conversation(prompt)
+    text = result.get('final_response', '') if isinstance(result, dict) else str(result)
+    text = text.strip() if text else '(no response)'
     with open(outfile, 'w') as f:
         f.write(text)
 except Exception as e:
