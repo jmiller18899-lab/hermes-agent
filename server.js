@@ -35,29 +35,8 @@ function sendJSON(res, status, body) {
 }
 
 function cleanOutput(raw) {
-  // Find where the actual agent reply starts — after the last === header block
-  const lines = raw.split("\n");
-  
-  // Find the last occurrence of a === divider — reply comes after it
-  let lastDivider = -1;
-  for (let i = 0; i < lines.length; i++) {
-    if (lines[i].startsWith("===")) lastDivider = i;
-  }
-  
-  // Take everything after the last divider block
-  let replyLines = lastDivider >= 0 ? lines.slice(lastDivider + 1) : lines;
-  
-  // Strip trailing summary block (CONVERSATION SUMMARY onwards)
-  let summaryIdx = replyLines.findIndex(l => l.includes("CONVERSATION SUMMARY"));
-  if (summaryIdx >= 0) replyLines = replyLines.slice(0, summaryIdx);
-  
-  // Strip leading/trailing blank lines and emoji-only status lines
-  replyLines = replyLines.filter((l, i) => {
-    if (/^[🤖🔄⏱️💾]/.test(l.trim()) && l.trim().length < 60) return false;
-    return true;
-  });
-  
-  return replyLines.join("\n").trim() || raw.trim();
+  // chat() already returns the clean reply — just trim whitespace
+  return raw.trim();
 }
 
 function buildPythonScript(prompt, history, sessionId) {
