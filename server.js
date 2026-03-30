@@ -120,14 +120,18 @@ try:
     agent._print_fn = lambda *a, **kw: None
 
     result = agent.run_conversation(prompt)
-    text = result.get('final_response', '') if isinstance(result, dict) else str(result)
-    text = text.strip() if text else '(no response)'
+    if isinstance(result, dict):
+        text = result.get('final_response') or result.get('response') or str(result)
+    else:
+        text = str(result) if result else ''
+    text = text.strip() if text else '(no response from agent)'
     with open(outfile, 'w') as f:
         f.write(text)
 except Exception as e:
     import traceback
+    tb = traceback.format_exc()
     with open(outfile, 'w') as f:
-        f.write('Error: ' + str(e))
+        f.write('Error: ' + str(e) + '\n\n' + tb[-1000:])
 `;
 
       const child = spawn('python', ['-c', pyScript], {
