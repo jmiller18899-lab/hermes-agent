@@ -67,10 +67,13 @@ COMMAND_REGISTRY: list[CommandDef] = [
                gateway_only=True),
     CommandDef("background", "Run a prompt in the background", "Session",
                aliases=("bg",), args_hint="<prompt>"),
+    CommandDef("btw", "Ephemeral side question using session context (no tools, not persisted)", "Session",
+               args_hint="<question>"),
     CommandDef("queue", "Queue a prompt for the next turn (doesn't interrupt)", "Session",
                aliases=("q",), args_hint="<prompt>"),
     CommandDef("status", "Show session info", "Session",
                gateway_only=True),
+    CommandDef("profile", "Show active profile name and home directory", "Info"),
     CommandDef("sethome", "Set this chat as the home channel", "Session",
                gateway_only=True, aliases=("set-home",)),
     CommandDef("resume", "Resume a previously-named session", "Session",
@@ -90,6 +93,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("verbose", "Cycle tool progress display: off -> new -> all -> verbose",
                "Configuration", cli_only=True,
                gateway_config_gate="display.tool_progress_command"),
+    CommandDef("yolo", "Toggle YOLO mode (skip all dangerous command approvals)",
+               "Configuration"),
     CommandDef("reasoning", "Manage reasoning effort and display", "Configuration",
                args_hint="[level|show|hide]",
                subcommands=("none", "low", "minimal", "medium", "high", "xhigh", "show", "hide", "on", "off")),
@@ -118,6 +123,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
                "Tools & Skills", cli_only=True),
 
     # Info
+    CommandDef("commands", "Browse all commands and skills (paginated)", "Info",
+               gateway_only=True, args_hint="[page]"),
     CommandDef("help", "Show available commands", "Info"),
     CommandDef("usage", "Show token usage for the current session", "Info"),
     CommandDef("insights", "Show usage insights and analytics", "Info",
@@ -359,6 +366,69 @@ def telegram_bot_commands() -> list[tuple[str, str]]:
         tg_name = cmd.name.replace("-", "_")
         result.append((tg_name, cmd.description))
     return result
+
+
+def telegram_menu_commands(max_commands: int = 100) -> tuple[list[tuple[str, str]], int]:
+    """Return Telegram menu commands capped to the Bot API limit.
+
+    Priority order (higher priority = never bumped by overflow):
+      1. Core CommandDef commands (always included)
+      2. Plugin slash commands (take precedence over skills)
+      3. Built-in skill commands (fill remaining slots, alphabetical)
+
+    Skills are the only tier that gets trimmed when the cap is hit.
+    User-installed hub skills are excluded — accessible via /skills.
+
+    Returns:
+        (menu_commands, hidden_count) where hidden_count is the number of
+        skill commands omitted due to the cap.
+    """
+    all_commands = list(telegram_bot_commands())
+
+    # Plugin slash commands get priority over skills
+    try:
+        from hermes_cli.plugins import get_plugin_manager
+        pm = get_plugin_manager()
+        plugin_cmds = getattr(pm, "_plugin_commands", {})
+        for cmd_name in sorted(plugin_cmds):
+            tg_name = cmd_name.replace("-", "_")
+            desc = "Plugin command"
+            if len(desc) > 40:
+                desc = desc[:37] + "..."
+            all_commands.append((tg_name, desc))
+    except Exception:
+        pass
+
+    # Remaining slots go to built-in skill commands (not hub-installed).
+    skill_entries: list[tuple[str, str]] = []
+    try:
+        from agent.skill_commands import get_skill_commands
+        from tools.skills_tool import SKILLS_DIR
+        _skills_dir = str(SKILLS_DIR.resolve())
+        _hub_dir = str((SKILLS_DIR / ".hub").resolve())
+        skill_cmds = get_skill_commands()
+        for cmd_key in sorted(skill_cmds):
+            info = skill_cmds[cmd_key]
+            skill_path = info.get("skill_md_path", "")
+            if not skill_path.startswith(_skills_dir):
+                continue
+            if skill_path.startswith(_hub_dir):
+                continue
+            name = cmd_key.lstrip("/").replace("-", "_")
+            desc = info.get("description", "")
+            # Keep descriptions short — setMyCommands has an undocumented
+            # total payload limit.  40 chars fits 100 commands safely.
+            if len(desc) > 40:
+                desc = desc[:37] + "..."
+            skill_entries.append((name, desc))
+    except Exception:
+        pass
+
+    # Skills fill remaining slots — they're the only tier that gets trimmed
+    remaining_slots = max(0, max_commands - len(all_commands))
+    hidden_count = max(0, len(skill_entries) - remaining_slots)
+    all_commands.extend(skill_entries[:remaining_slots])
+    return all_commands[:max_commands], hidden_count
 
 
 def slack_subcommand_map() -> dict[str, str]:

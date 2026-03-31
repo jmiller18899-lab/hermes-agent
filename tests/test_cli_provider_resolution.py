@@ -424,6 +424,7 @@ def test_cmd_model_falls_back_to_auto_on_invalid_provider(monkeypatch, capsys):
 
     monkeypatch.setattr("hermes_cli.auth.resolve_provider", _resolve_provider)
     monkeypatch.setattr(hermes_main, "_prompt_provider_choice", lambda choices: len(choices) - 1)
+    monkeypatch.setattr("sys.stdin", type("FakeTTY", (), {"isatty": lambda self: True})())
 
     hermes_main.cmd_model(SimpleNamespace())
     output = capsys.readouterr().out
@@ -466,6 +467,6 @@ def test_model_flow_custom_saves_verified_v1_base_url(monkeypatch, capsys):
     output = capsys.readouterr().out
 
     assert "Saving the working base URL instead" in output
-    assert saved_env["OPENAI_BASE_URL"] == "http://localhost:8000/v1"
-    assert saved_env["OPENAI_API_KEY"] == "local-key"
+    # OPENAI_BASE_URL is no longer saved to .env — config.yaml is authoritative
+    assert "OPENAI_BASE_URL" not in saved_env
     assert saved_env["MODEL"] == "llm"

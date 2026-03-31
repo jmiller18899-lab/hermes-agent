@@ -63,8 +63,11 @@ def _get_model_config() -> Dict[str, Any]:
     model_cfg = config.get("model")
     if isinstance(model_cfg, dict):
         cfg = dict(model_cfg)
-        default = cfg.get("default", "").strip()
-        base_url = cfg.get("base_url", "").strip()
+        # Accept "model" as alias for "default" (users intuitively write model.model)
+        if not cfg.get("default") and cfg.get("model"):
+            cfg["default"] = cfg["model"]
+        default = (cfg.get("default") or "").strip()
+        base_url = (cfg.get("base_url") or "").strip()
         is_local = "localhost" in base_url or "127.0.0.1" in base_url
         is_fallback = not default or default == "anthropic/claude-opus-4.6"
         if is_local and is_fallback and base_url:
@@ -203,7 +206,7 @@ def _resolve_named_custom_runtime(
         or _detect_api_mode_for_url(base_url)
         or "chat_completions",
         "base_url": base_url,
-        "api_key": api_key,
+        "api_key": api_key or "no-key-required",
         "source": f"custom_provider:{custom_provider.get('name', requested_provider)}",
     }
 
@@ -226,28 +229,22 @@ def _resolve_openrouter_runtime(
     requested_norm = (requested_provider or "").strip().lower()
     cfg_provider = cfg_provider.strip().lower()
 
-    env_openai_base_url = os.getenv("OPENAI_BASE_URL", "").strip()
     env_openrouter_base_url = os.getenv("OPENROUTER_BASE_URL", "").strip()
 
+    # Use config base_url when available and the provider context matches.
+    # OPENAI_BASE_URL env var is no longer consulted — config.yaml is
+    # the single source of truth for endpoint URLs.
     use_config_base_url = False
     if cfg_base_url.strip() and not explicit_base_url:
         if requested_norm == "auto":
-            if (not cfg_provider or cfg_provider == "auto") and not env_openai_base_url:
+            if not cfg_provider or cfg_provider == "auto":
                 use_config_base_url = True
         elif requested_norm == "custom" and cfg_provider == "custom":
-            # provider: custom — use base_url from config (Fixes #1760).
             use_config_base_url = True
 
-    # When the user explicitly requested the openrouter provider, skip
-    # OPENAI_BASE_URL — it typically points to a custom / non-OpenRouter
-    # endpoint and would prevent switching back to OpenRouter (#874).
-    skip_openai_base = requested_norm == "openrouter"
-
-    # For custom, prefer config base_url over env so config.yaml is honored (#1760).
     base_url = (
         (explicit_base_url or "").strip()
         or (cfg_base_url.strip() if use_config_base_url else "")
-        or ("" if skip_openai_base else env_openai_base_url)
         or env_openrouter_base_url
         or OPENROUTER_BASE_URL
     ).rstrip("/")
@@ -407,12 +404,6 @@ def resolve_runtime_provider(
             # (e.g. https://api.minimax.io/anthropic, https://dashscope.../anthropic)
             elif base_url.rstrip("/").endswith("/anthropic"):
                 api_mode = "anthropic_messages"
-            # MiniMax providers always use Anthropic Messages API.
-            # Auto-correct stale /v1 URLs (from old .env or config) to /anthropic.
-            elif provider in ("minimax", "minimax-cn"):
-                api_mode = "anthropic_messages"
-                if base_url.rstrip("/").endswith("/v1"):
-                    base_url = base_url.rstrip("/")[:-3] + "/anthropic"
         return {
             "provider": provider,
             "api_mode": api_mode,
