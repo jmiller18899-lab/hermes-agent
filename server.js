@@ -62,8 +62,8 @@ const server = http.createServer((req, res) => {
       const outFile = path.join(os.tmpdir(), 'hr_' + Date.now() + '_' + Math.random().toString(36).slice(2) + '.txt');
 
       // Spawn the separate python runner script — no escape issues
-      const child = spawn('python', ['/app/hermes_runner.py', outFile, prompt], {
-        cwd: '/app',
+      const child = spawn('python', [process.env.HERMES_RUNNER || '/opt/hermes/hermes_runner.py', outFile, prompt], {
+        cwd: process.env.HERMES_DIR || '/opt/hermes',
         env: { ...process.env, HERMES_QUIET:'1', HOME:'/data', PYTHONUNBUFFERED:'1' }
       });
 
