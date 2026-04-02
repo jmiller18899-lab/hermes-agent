@@ -8,19 +8,17 @@ COPY . /opt/hermes
 WORKDIR /opt/hermes
 
 # Install Python hermes package
-RUN pip install -e ".[all]" --break-system-packages || \
-    pip install -e "." --break-system-packages
+RUN pip install -e "." --break-system-packages || \
+    pip install -r requirements.txt --break-system-packages || true
 
-# Install Node deps
+# Install Node deps (express)
 RUN npm install --omit=dev
 
-# Install opencli-rs
-RUN curl -fsSL https://github.com/nashsu/opencli-rs/releases/download/v0.1.3/opencli-rs-x86_64-unknown-linux-musl.tar.gz \
-    | tar -xz -C /usr/local/bin/ && chmod +x /usr/local/bin/opencli-rs 2>/dev/null || true
-
 ENV HERMES_HOME=/opt/data
+ENV HERMES_DIR=/opt/hermes
+ENV HERMES_RUNNER=/opt/hermes/hermes_runner.py
 ENV PORT=8080
 
 EXPOSE 8080
 
-CMD ["node", "/opt/hermes/server.js"]
+CMD ["node", "server.js"]
