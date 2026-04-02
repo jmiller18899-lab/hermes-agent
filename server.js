@@ -62,7 +62,7 @@ const server = http.createServer((req, res) => {
       const outFile = path.join(os.tmpdir(), 'hr_' + Date.now() + '_' + Math.random().toString(36).slice(2) + '.txt');
 
       // Spawn the separate python runner script — no escape issues
-      const child = spawn('python', [process.env.HERMES_RUNNER || '/opt/hermes/hermes_runner.py', outFile, prompt], {
+      const child = spawn('python3', [process.env.HERMES_RUNNER || '/opt/hermes/hermes_runner.py', outFile, prompt], {
         cwd: process.env.HERMES_DIR || '/opt/hermes',
         env: { ...process.env, HERMES_QUIET:'1', HOME:'/data', PYTHONUNBUFFERED:'1' }
       });
@@ -89,7 +89,8 @@ const server = http.createServer((req, res) => {
         try {
           if (fs.existsSync(outFile)) { text = fs.readFileSync(outFile,'utf8').trim(); fs.unlinkSync(outFile); }
         } catch {}
-        if (!text) text = stderr ? 'Error: '+stderr.slice(0,300) : '(no response)';
+        if (!text) text = stderr ? 'Error: '+stderr.slice(0,600) : '(no response - python may have crashed)';
+        console.error('[hermes] stderr:', stderr.slice(0,600));
         sess.h.push({role:'user',content:prompt},{role:'assistant',content:text});
         if (sess.h.length > 40) sess.h = sess.h.slice(-40);
         res.end(reply(text, payload.model));
