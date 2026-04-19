@@ -19,7 +19,7 @@ MEMORY_BASE = os.environ.get(
 # OpenRouter Gemma config
 OPENROUTER_KEY = os.environ.get('OPENROUTER_API_KEY', '')
 # Use free Gemma 3 27B on OpenRouter
-GEMMA_MODEL = os.environ.get('HERMES_MODEL', 'google/gemma-3-27b-it:free')
+GEMMA_MODEL = os.environ.get('HERMES_MODEL', 'meta-llama/llama-4-scout:free')
 
 def read_shared_memory(limit=8):
     try:
