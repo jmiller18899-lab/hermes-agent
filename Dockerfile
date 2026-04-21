@@ -1,46 +1,31 @@
-FROM ghcr.io/astral-sh/uv:0.11.6-python3.13-trixie@sha256:b3c543b6c4f23a5f2df22866bd7857e5d304b67a564f4feab6ac22044dde719b AS uv_source
-FROM tianon/gosu:1.19-trixie@sha256:3b176695959c71e123eb390d427efc665eeb561b1540e82679c15e992006b8b9 AS gosu_source
-FROM debian:13.4
+FROM debian:bookworm-slim
 
-# Disable Python stdout buffering to ensure logs are printed immediately
-ENV PYTHONUNBUFFERED=1
+RUN apt-get update && apt-get install -y \
+    curl bash git nodejs npm python3 python3-pip \
+    ripgrep ffmpeg gcc python3-dev libffi-dev \
+    && ln -sf /usr/bin/python3 /usr/bin/python \
+    && rm -rf /var/lib/apt/lists/*
 
-# Store Playwright browsers outside the volume mount so the build-time
-# install survives the /opt/data volume overlay at runtime.
-ENV PLAYWRIGHT_BROWSERS_PATH=/opt/hermes/.playwright
+# Install Hermes using the official install script
+RUN curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash
 
-# Install system dependencies in one layer, clear APT cache
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends \
-        build-essential nodejs npm python3 ripgrep ffmpeg gcc python3-dev libffi-dev procps && \
-    rm -rf /var/lib/apt/lists/*
-
-# Non-root user for runtime; UID can be overridden via HERMES_UID at runtime
-RUN useradd -u 10000 -m -d /opt/data hermes
-
-COPY --chmod=0755 --from=gosu_source /gosu /usr/local/bin/
-COPY --chmod=0755 --from=uv_source /usr/local/bin/uv /usr/local/bin/uvx /usr/local/bin/
-
-COPY . /opt/hermes
+# Copy our custom gateway files on top
 WORKDIR /opt/hermes
+COPY server.js .
+COPY hermes_runner.py .
+COPY package.json .
 
-# Install Node dependencies and Playwright as root (--with-deps needs apt)
-RUN npm install --prefer-offline --no-audit && \
-    npx playwright install --with-deps chromium --only-shell && \
-    cd /opt/hermes/scripts/whatsapp-bridge && \
-    npm install --prefer-offline --no-audit && \
-    npm cache clean --force
+# Install Node deps (express)
+RUN npm install --omit=dev
 
-# Hand ownership to hermes user, then install Python deps in a virtualenv
-RUN chown -R hermes:hermes /opt/hermes
-USER hermes
+# Create data dir
+RUN mkdir -p /data/.hermes
 
-RUN uv venv && \
-    uv pip install --no-cache-dir -e ".[all]"
+ENV HERMES_HOME=/data
+ENV HERMES_DIR=/opt/hermes
+ENV HERMES_RUNNER=/opt/hermes/hermes_runner.py
+ENV PORT=8080
 
-USER root
-RUN chmod +x /opt/hermes/docker/entrypoint.sh
+EXPOSE 8080
 
-ENV HERMES_HOME=/opt/data
-VOLUME [ "/opt/data" ]
-ENTRYPOINT [ "/opt/hermes/docker/entrypoint.sh" ]
+CMD ["node", "server.js"]
