@@ -236,6 +236,58 @@ def print_noninteractive_setup_guidance(reason: str | None = None) -> None:
     print()
 
 
+def _run_deploy_setup(config: dict, hermes_home) -> None:
+    """Apply a deployment-friendly, non-interactive setup baseline.
+
+    This path is intentionally conservative: it avoids interactive prompts while
+    ensuring deployed app/server instances have a usable config and broad tool
+    access out of the box.
+    """
+    # Ensure latest config schema before writing defaults.
+    from hermes_cli.config import check_config_version, migrate_config
+
+    current_ver, latest_ver = check_config_version()
+    if current_ver < latest_ver:
+        migrate_config()
+        config.clear()
+        config.update(load_config())
+
+    changed = False
+
+    # If the model is unset, honor HERMES_MODEL/LLM_MODEL when provided.
+    deploy_model = (
+        os.getenv("HERMES_MODEL", "").strip()
+        or os.getenv("LLM_MODEL", "").strip()
+    )
+    if deploy_model and not _model_config_dict(config).get("default"):
+        _set_default_model(config, deploy_model)
+        changed = True
+
+    # Enable the API-server full toolset for deployed app runtimes.
+    if config.get("toolsets") != ["hermes-api-server"]:
+        config["toolsets"] = ["hermes-api-server"]
+        changed = True
+
+    # Ensure core sections exist even when starting from a sparse config.
+    for key, value in (
+        ("agent", copy.deepcopy(DEFAULT_CONFIG.get("agent", {}))),
+        ("terminal", copy.deepcopy(DEFAULT_CONFIG.get("terminal", {}))),
+        ("memory", copy.deepcopy(DEFAULT_CONFIG.get("memory", {}))),
+    ):
+        if not isinstance(config.get(key), dict):
+            config[key] = value
+            changed = True
+
+    if changed:
+        save_config(config)
+
+    print()
+    print_success("Deployment setup complete.")
+    print_info(f"Config path: {hermes_home / 'config.yaml'}")
+    print_info("Enabled toolset: hermes-api-server (full app/server feature set)")
+    print()
+
+
 def prompt(question: str, default: str = None, password: bool = False) -> str:
     """Prompt for input with optional default."""
     if default:
@@ -2759,6 +2811,12 @@ def run_setup_wizard(args):
     non_interactive = getattr(args, 'non_interactive', False)
     if not non_interactive and not is_interactive_stdin():
         non_interactive = True
+
+    deploy_mode = bool(getattr(args, "deploy", False))
+
+    if non_interactive and deploy_mode:
+        _run_deploy_setup(config, hermes_home)
+        return
 
     if non_interactive:
         print_noninteractive_setup_guidance(

@@ -12,6 +12,7 @@ def _make_setup_args(**overrides):
         non_interactive=overrides.get("non_interactive", False),
         section=overrides.get("section", None),
         reset=overrides.get("reset", False),
+        deploy=overrides.get("deploy", False),
     )
 
 
@@ -82,6 +83,24 @@ class TestNonInteractiveSetup:
 
         out = capsys.readouterr().out
         assert "hermes config set model.provider custom" in out
+
+    def test_non_interactive_deploy_runs_deploy_setup(self):
+        """--deploy should run non-interactive deployment bootstrap instead of guidance."""
+        from hermes_cli.setup import run_setup_wizard
+
+        args = _make_setup_args(non_interactive=True, deploy=True)
+
+        with (
+            patch("hermes_cli.setup.ensure_hermes_home"),
+            patch("hermes_cli.setup.load_config", return_value={}),
+            patch("hermes_cli.setup.get_hermes_home", return_value="/tmp/.hermes"),
+            patch("hermes_cli.setup._run_deploy_setup") as mock_deploy_setup,
+            patch("hermes_cli.setup.print_noninteractive_setup_guidance") as mock_guidance,
+        ):
+            run_setup_wizard(args)
+
+        mock_deploy_setup.assert_called_once_with({}, "/tmp/.hermes")
+        mock_guidance.assert_not_called()
 
     def test_no_tty_skips_wizard(self, capsys):
         """When stdin has no TTY, the setup wizard should print guidance and return."""
