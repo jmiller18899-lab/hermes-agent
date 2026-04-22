@@ -8,6 +8,7 @@ const path = require('path');
 const PORT = process.env.PORT || 8080;
 const DATA_DIR = process.env.HERMES_HOME || '/data';
 const SESSIONS_FILE = path.join(DATA_DIR, 'sessions.json');
+const AUTO_SETUP_ON_DEPLOY = (process.env.HERMES_AUTO_SETUP_ON_DEPLOY || '1') !== '0';
 
 // ── Persistent session store ─────────────────────────────────────
 // Loads from disk on startup, saves after every message
@@ -38,6 +39,29 @@ function saveSessions() {
 
 // Load on startup
 loadSessions();
+
+function runDeploySetupOnce() {
+  if (!AUTO_SETUP_ON_DEPLOY) return;
+  try {
+    const child = spawn('hermes', ['setup', '--non-interactive', '--deploy'], {
+      env: { ...process.env, HERMES_HOME: DATA_DIR, HOME: DATA_DIR, HERMES_QUIET: '1' },
+      stdio: 'pipe'
+    });
+    child.stdout.on('data', (d) => process.stdout.write(`[setup] ${d}`));
+    child.stderr.on('data', (d) => process.stderr.write(`[setup] ${d}`));
+    child.on('close', (code) => {
+      if (code === 0) {
+        console.log('[setup] Deployment bootstrap completed');
+      } else {
+        console.warn(`[setup] Deployment bootstrap exited with code ${code}`);
+      }
+    });
+  } catch (e) {
+    console.warn('[setup] Failed to launch deployment bootstrap:', e.message);
+  }
+}
+
+runDeploySetupOnce();
 
 // Clean up sessions older than 7 days, save every 5 min
 setInterval(() => {

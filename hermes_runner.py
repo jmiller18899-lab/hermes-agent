@@ -88,6 +88,8 @@ try:
     else:
         runtime = resolve_runtime_provider()
 
+    enabled_toolsets = os.environ.get('HERMES_ENABLED_TOOLSETS', 'hermes-api-server')
+
     agent = AIAgent(
         api_key=runtime.get('api_key'),
         base_url=runtime.get('base_url', 'https://openrouter.ai/api/v1'),
@@ -96,7 +98,7 @@ try:
         max_iterations=20,
         quiet_mode=False,
         max_tokens=4096,
-        enabled_toolsets=['core', 'files', 'terminal', 'memory'],
+        enabled_toolsets=[t.strip() for t in enabled_toolsets.split(',') if t.strip()],
     )
     agent._print_fn = lambda *a, **kw: None
 
