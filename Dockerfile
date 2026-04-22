@@ -6,8 +6,16 @@ RUN apt-get update && apt-get install -y \
     && ln -sf /usr/bin/python3 /usr/bin/python \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Hermes using the official install script
-RUN curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash
+# Install Hermes using the official install script.
+# Download first, then run with stdin from /dev/null to prevent the interactive
+# setup wizard from failing the build (it reads from /dev/tty which does not
+# exist in Docker). The || true suppresses the wizard exit code while the
+# final test ensures the real installation actually completed.
+RUN curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh -o /tmp/install.sh \
+    && chmod +x /tmp/install.sh \
+    && bash /tmp/install.sh < /dev/null || true \
+    && rm -f /tmp/install.sh \
+    && test -d /root/.hermes/hermes-agent
 
 # Copy our custom gateway files on top
 WORKDIR /opt/hermes
