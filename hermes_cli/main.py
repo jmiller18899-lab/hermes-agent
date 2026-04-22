@@ -4821,6 +4821,11 @@ For more help on a command:
         action="store_true",
         help="Reset configuration to defaults"
     )
+    setup_parser.add_argument(
+        "--deploy",
+        action="store_true",
+        help="Deployment bootstrap mode (non-interactive, configures defaults for app/server runtimes)"
+    )
     setup_parser.set_defaults(func=cmd_setup)
 
     # =========================================================================
