@@ -18,6 +18,9 @@ RUN git clone --depth=1 https://github.com/NousResearch/hermes-agent /data/.herm
        openai anthropic httpx mcp requests fire rich click pydantic \
        python-dotenv aiohttp websockets tiktoken
 
+# Ensure all commonly missing packages are present
+RUN pip3 install --break-system-packages pyyaml pydantic-settings jinja2 cryptography paramiko pyperclip playsound || true
+
 # Copy our gateway files
 COPY server.js /data/.hermes/hermes-agent/server.js
 COPY hermes_runner.py /data/.hermes/hermes-agent/hermes_runner.py
