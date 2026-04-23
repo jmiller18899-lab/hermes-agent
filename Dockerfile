@@ -25,6 +25,7 @@ COPY package.json /data/.hermes/hermes-agent/package.json
 RUN cd /data/.hermes/hermes-agent && npm install --omit=dev
 
 ENV HERMES_DIR=/data/.hermes/hermes-agent
+ENV PATH="/data/.hermes/bin:/data/.hermes/hermes-agent/.venv/bin:${PATH}"
 ENV HERMES_RUNNER=/data/.hermes/hermes-agent/hermes_runner.py
 ENV PORT=8080
 
