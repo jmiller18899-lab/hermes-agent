@@ -1,5 +1,7 @@
 import sys, os, json as _json, urllib.request
-sys.path.insert(0, '/opt/hermes')
+# Try multiple possible install locations
+for _p in ['/data/.hermes/hermes-agent', '/opt/hermes', os.path.dirname(os.path.abspath(__file__))]:
+    if _p not in sys.path: sys.path.insert(0, _p)
 os.environ['HERMES_QUIET'] = '1'
 os.environ['HOME'] = '/data'
 os.makedirs('/data/.hermes', exist_ok=True)
