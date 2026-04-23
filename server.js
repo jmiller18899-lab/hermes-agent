@@ -188,8 +188,8 @@ const server = http.createServer((req, res) => {
         console.error('[memory] Failed to write hist file:', e.message);
       }
 
-      const runner = process.env.HERMES_RUNNER || '/opt/hermes/hermes_runner.py';
-      const cwd = process.env.HERMES_DIR || '/opt/hermes';
+      const runner = process.env.HERMES_RUNNER || '/data/.hermes/hermes-agent/hermes_runner.py';
+      const cwd = process.env.HERMES_DIR || '/data/.hermes/hermes-agent';
 
       const child = spawn('python3', [runner, outFile, prompt, '--history', histFile], {
         cwd,
