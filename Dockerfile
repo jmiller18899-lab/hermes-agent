@@ -16,6 +16,9 @@ RUN mkdir -p /data
 RUN curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh \
     | bash -s -- --no-venv --skip-setup || true
 
+# Install required Python packages
+RUN pip3 install --break-system-packages openai anthropic httpx mcp requests
+
 # Copy our gateway files alongside the installed hermes
 COPY server.js /data/.hermes/hermes-agent/server.js
 COPY hermes_runner.py /data/.hermes/hermes-agent/hermes_runner.py
