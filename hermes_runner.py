@@ -22,7 +22,7 @@ args = p.parse_args()
 
 MEMORY_BASE = os.environ.get('NULLCLAW_BACKEND', 'https://nullclaw-backend-production.up.railway.app').rstrip('/')
 OPENROUTER_KEY = os.environ.get('OPENROUTER_API_KEY', '')
-GEMMA_MODEL = os.environ.get('HERMES_MODEL', 'google/gemma-3-12b-it:free')
+GEMMA_MODEL = os.environ.get('HERMES_MODEL', 'meta-llama/llama-4-scout:free')  # 128K context
 
 def read_shared_memory(limit=5):
     try:
