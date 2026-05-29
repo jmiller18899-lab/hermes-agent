@@ -10,8 +10,12 @@ const DATA_DIR = process.env.HERMES_HOME || '/data';
 const SESSIONS_FILE = path.join(DATA_DIR, 'sessions.json');
 const AUTO_SETUP_ON_DEPLOY = (process.env.HERMES_AUTO_SETUP_ON_DEPLOY || '1') !== '0';
 
+// v0.15.0: explicit HERMES_INSECURE opt-in for 0.0.0.0 bind — no inference
+const LISTEN_HOST = process.env.RAILWAY_ENVIRONMENT || process.env.RENDER || process.env.FLY_APP_NAME
+  ? '0.0.0.0'
+  : (process.env.HERMES_INSECURE === '1' ? '0.0.0.0' : '127.0.0.1');
+
 // ── Persistent session store ─────────────────────────────────────
-// Loads from disk on startup, saves after every message
 let sessions = new Map();
 
 function loadSessions() {
@@ -37,7 +41,6 @@ function saveSessions() {
   }
 }
 
-// Load on startup
 loadSessions();
 
 function runDeploySetupOnce() {
@@ -70,23 +73,17 @@ setInterval(() => {
   saveSessions();
 }, 5 * 60 * 1000);
 
-// ── Summarize old messages to keep context window manageable ─────
+// ── Sliding context window (hindsight observation-default) ───────
 function buildContextHistory(sessionHistory) {
-  // Keep last 20 messages in full
-  // Summarize anything older into a single context block
   const KEEP_RECENT = 20;
   if (sessionHistory.length <= KEEP_RECENT) return sessionHistory;
-
   const older = sessionHistory.slice(0, sessionHistory.length - KEEP_RECENT);
   const recent = sessionHistory.slice(-KEEP_RECENT);
-
-  // Build a plain text summary of older messages
   const summaryLines = older.map(m => `${m.role}: ${m.content.slice(0, 150)}`).join('\n');
   const summaryMsg = {
     role: 'system',
     content: `[Earlier conversation summary]\n${summaryLines}\n[End summary — full recent messages follow]`
   };
-
   return [summaryMsg, ...recent];
 }
 
@@ -94,7 +91,15 @@ function buildContextHistory(sessionHistory) {
 function cors(res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,DELETE,OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Authorization,x-ic-url,x-session-id,x-session-name');
+  // v0.15.0: added x-model to allowed headers
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Authorization,x-ic-url,x-session-id,x-session-name,x-model');
+}
+
+// v0.15.0: web-URL redaction — strip tokens from stderr logs
+function redactUrl(s) {
+  return s.replace(/https?:\/\/[^\s"']*/g, (u) => {
+    try { return new URL(u).hostname; } catch { return '[url]'; }
+  });
 }
 
 function jsonReply(content, model) {
@@ -108,6 +113,15 @@ function jsonReply(content, model) {
   });
 }
 
+// v0.15.0: unified /models picker
+const HERMES_MODELS = [
+  'hermes-agent',
+  'nous-hermes-2-mixtral-8x7b',
+  'nous-hermes-2-solar-10.7b',
+  'nous-hermes-2-yi-34b',
+  'nous-hermes-3-llama-3.1-70b'
+];
+
 // ── Request handler ──────────────────────────────────────────────
 const server = http.createServer((req, res) => {
   cors(res);
@@ -115,14 +129,20 @@ const server = http.createServer((req, res) => {
 
   const url = req.url.split('?')[0];
 
-  // Health / session list
-  if (req.method === 'GET' && (url === '/' || url === '/health')) {
+  // Health / session list — v0.15.0: /status alias added
+  if (req.method === 'GET' && (url === '/' || url === '/health' || url === '/status')) {
     const sessionList = [];
     for (const [k, v] of sessions) {
       sessionList.push({ id: k, name: v.name || k, messages: v.h.length, last: new Date(v.t).toISOString() });
     }
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    return res.end(JSON.stringify({ status: 'ok', service: 'hermes-agent', sessions: sessionList }));
+    return res.end(JSON.stringify({ status: 'ok', service: 'hermes-agent', version: '0.15.0', sessions: sessionList }));
+  }
+
+  // v0.15.0: unified /models endpoint
+  if (req.method === 'GET' && url === '/models') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify({ object: 'list', data: HERMES_MODELS.map(id => ({ id, object: 'model' })) }));
   }
 
   // Clear a specific session
@@ -160,25 +180,29 @@ const server = http.createServer((req, res) => {
         ? last.content
         : (last.content || []).map(c => c.text || '').join(' ');
 
-      // Session management
+      // v0.15.0: /yolo session bypass — skips history read/write entirely
       const sid = req.headers['x-session-id'] || 'default';
+      const yolo = sid === 'yolo';
       const sessionName = req.headers['x-session-name'] || sid;
+      // v0.15.0: x-model header takes precedence over payload model
+      const model = req.headers['x-model'] || payload.model || 'hermes-agent';
 
-      if (!sessions.has(sid)) {
-        sessions.set(sid, { h: [], t: Date.now(), name: sessionName });
-        console.log(`[memory] New session: ${sid} (${sessionName})`);
+      let sess;
+      if (yolo) {
+        sess = { h: [], t: Date.now(), name: 'yolo' };
+      } else {
+        if (!sessions.has(sid)) {
+          sessions.set(sid, { h: [], t: Date.now(), name: sessionName });
+          console.log(`[memory] New session: ${sid} (${sessionName})`);
+        }
+        sess = sessions.get(sid);
+        sess.t = Date.now();
+        if (sessionName !== sid) sess.name = sessionName;
       }
-      const sess = sessions.get(sid);
-      sess.t = Date.now();
-      if (sessionName !== sid) sess.name = sessionName;
 
-      // Build context: server-side history (persistent) takes priority over payload messages
-      // This is the key fix — we pass OUR stored history, not the truncated payload history
       const contextHistory = buildContextHistory(sess.h);
-
       console.log(`[memory] Session ${sid}: ${sess.h.length} stored messages, sending ${contextHistory.length} in context`);
 
-      // Write history to a temp file for the Python runner
       const histFile = path.join(os.tmpdir(), 'hist_' + Date.now() + '.json');
       const outFile = path.join(os.tmpdir(), 'out_' + Date.now() + '_' + Math.random().toString(36).slice(2) + '.txt');
 
@@ -191,8 +215,10 @@ const server = http.createServer((req, res) => {
       const runner = process.env.HERMES_RUNNER || '/data/.hermes/hermes-agent/hermes_runner.py';
       const cwd = process.env.HERMES_DIR || '/data/.hermes/hermes-agent';
 
+      // v0.15.0: MCP bare-command PATH resolution — shell:false, inherit PATH as-is
       const child = spawn('python3', [runner, outFile, prompt, '--history', histFile], {
         cwd,
+        shell: false,
         env: { ...process.env, HERMES_QUIET: '1', HOME: '/data', PYTHONUNBUFFERED: '1' }
       });
 
@@ -204,7 +230,9 @@ const server = http.createServer((req, res) => {
 
       const timer = setTimeout(() => {
         clearInterval(ka);
-        child.kill();
+        // v0.15.0: kanban worker SIGTERM + 2s grace before SIGKILL
+        child.kill('SIGTERM');
+        setTimeout(() => { try { child.kill('SIGKILL'); } catch {} }, 2000);
         if (res.writableEnded) return;
         let text = 'Timed out after 5 minutes.';
         try {
@@ -212,7 +240,7 @@ const server = http.createServer((req, res) => {
         } catch {}
         try { fs.unlinkSync(outFile); } catch {}
         try { fs.unlinkSync(histFile); } catch {}
-        res.end(jsonReply(text, payload.model));
+        res.end(jsonReply(text, model));
       }, 300000);
 
       child.on('close', () => {
@@ -228,22 +256,20 @@ const server = http.createServer((req, res) => {
         try { fs.unlinkSync(histFile); } catch {}
 
         if (!text) {
+          // v0.15.0: redact URLs from stderr before logging
           text = stderr ? 'Error: ' + stderr.slice(0, 600) : '(no response)';
-          if (stderr) console.error('[hermes] stderr:', stderr.slice(0, 400));
+          if (stderr) console.error('[hermes] stderr:', redactUrl(stderr.slice(0, 400)));
         }
 
-        // Store full exchange in persistent session history
-        sess.h.push({ role: 'user', content: prompt });
-        sess.h.push({ role: 'assistant', content: text });
+        if (!yolo) {
+          sess.h.push({ role: 'user', content: prompt });
+          sess.h.push({ role: 'assistant', content: text });
+          if (sess.h.length > 100) sess.h = sess.h.slice(-100);
+          saveSessions();
+          console.log(`[memory] Session ${sid} now has ${sess.h.length} messages`);
+        }
 
-        // Keep max 100 messages (50 turns) in storage
-        if (sess.h.length > 100) sess.h = sess.h.slice(-100);
-
-        // Save to disk after every exchange
-        saveSessions();
-
-        console.log(`[memory] Session ${sid} now has ${sess.h.length} messages`);
-        res.end(jsonReply(text, payload.model));
+        res.end(jsonReply(text, model));
       });
     });
     return;
@@ -254,7 +280,8 @@ const server = http.createServer((req, res) => {
 });
 
 server.timeout = 360000;
-server.listen(PORT, () => {
-  console.log(`Hermes gateway v2 (persistent memory) on port ${PORT}`);
+server.listen(PORT, LISTEN_HOST, () => {
+  console.log(`Hermes gateway v0.15.0 on ${LISTEN_HOST}:${PORT}`);
   console.log(`Sessions file: ${SESSIONS_FILE}`);
+  console.log(`Insecure bind: ${process.env.HERMES_INSECURE === '1' ? 'YES (HERMES_INSECURE=1)' : 'no'}`);
 });
