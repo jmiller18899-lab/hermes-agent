@@ -1,7 +1,7 @@
 'use strict';
 const http = require('http');
 const https = require('https');
-const { spawn } = require('child_process');
+const { spawn, execFileSync } = require('child_process');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -15,6 +15,32 @@ const AUTO_SETUP_ON_DEPLOY = (process.env.HERMES_AUTO_SETUP_ON_DEPLOY || '1') !=
 const LISTEN_HOST = process.env.RAILWAY_ENVIRONMENT || process.env.RENDER || process.env.FLY_APP_NAME
   ? '0.0.0.0'
   : (process.env.HERMES_INSECURE === '1' ? '0.0.0.0' : '127.0.0.1');
+
+// ── Python binary resolution ─────────────────────────────────────
+// Prefer PYTHON_BIN env var, then try common paths, then fall back to 'python3'
+function resolvePythonBin() {
+  const candidates = [
+    process.env.PYTHON_BIN,
+    '/usr/bin/python3',
+    '/usr/local/bin/python3',
+    '/opt/homebrew/bin/python3',
+    'python3',
+  ].filter(Boolean);
+
+  for (const candidate of candidates) {
+    try {
+      execFileSync(candidate, ['--version'], { stdio: 'pipe' });
+      console.log(`[python] Resolved python binary: ${candidate}`);
+      return candidate;
+    } catch (_) {
+      // not found, try next
+    }
+  }
+  console.warn('[python] Warning: no python3 binary found in any candidate path');
+  return 'python3'; // last resort
+}
+
+const PYTHON_BIN = resolvePythonBin();
 
 // ── Self-Improve Policy ──────────────────────────────────────────
 const SI_MODE        = (process.env.SELF_IMPROVE_MODE || 'off').toLowerCase();
@@ -236,7 +262,7 @@ const server = http.createServer((req, res) => {
     for (const [k, v] of sessions)
       sessionList.push({ id: k, name: v.name || k, messages: v.h.length, last: new Date(v.t).toISOString() });
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    return res.end(JSON.stringify({ status: 'ok', service: 'hermes-agent', version: '0.15.0', sessions: sessionList }));
+    return res.end(JSON.stringify({ status: 'ok', service: 'hermes-agent', version: '0.15.0', python_bin: PYTHON_BIN, sessions: sessionList }));
   }
 
   // Models
@@ -370,9 +396,10 @@ const server = http.createServer((req, res) => {
       const runner = process.env.HERMES_RUNNER || '/data/.hermes/hermes-agent/hermes_runner.py';
       const cwd    = process.env.HERMES_DIR    || '/data/.hermes/hermes-agent';
 
-      const child = spawn('python3', [runner, outFile, prompt, '--history', histFile], {
+      // Use resolved PYTHON_BIN instead of hardcoded 'python3'
+      const child = spawn(PYTHON_BIN, [runner, outFile, prompt, '--history', histFile], {
         cwd, shell: false,
-        env: { ...process.env, HERMES_QUIET: '1', HOME: '/data', PYTHONUNBUFFERED: '1' }
+        env: { ...process.env, HERMES_QUIET: '1', HOME: '/data', PYTHONUNBUFFERED: '1', PYTHON_BIN }
       });
 
       // Handle spawn errors gracefully (e.g. python3 not found)
@@ -433,6 +460,7 @@ server.timeout = 360000;
 server.listen(PORT, LISTEN_HOST, () => {
   const policy = getSIPolicy();
   console.log(`Hermes gateway v0.15.0 on ${LISTEN_HOST}:${PORT}`);
+  console.log(`Python binary: ${PYTHON_BIN}`);
   console.log(`Sessions file: ${SESSIONS_FILE}`);
   console.log(`Self-improve: mode=${SI_MODE} | policy=${policy.write_policy} | repos=${SI_ALLOWED.join(',') || 'none'}`);
   console.log(`Insecure bind: ${process.env.HERMES_INSECURE === '1' ? 'YES' : 'no'}`);
