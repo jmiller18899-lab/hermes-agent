@@ -1,5 +1,6 @@
 'use strict';
 const http = require('http');
+const https = require('https');
 const { spawn } = require('child_process');
 const fs = require('fs');
 const os = require('os');
@@ -14,6 +15,97 @@ const AUTO_SETUP_ON_DEPLOY = (process.env.HERMES_AUTO_SETUP_ON_DEPLOY || '1') !=
 const LISTEN_HOST = process.env.RAILWAY_ENVIRONMENT || process.env.RENDER || process.env.FLY_APP_NAME
   ? '0.0.0.0'
   : (process.env.HERMES_INSECURE === '1' ? '0.0.0.0' : '127.0.0.1');
+
+// ── Self-Improve Policy ──────────────────────────────────────────
+const SI_MODE         = (process.env.SELF_IMPROVE_MODE || 'off').toLowerCase();
+const SI_ALLOWED_RAW  = process.env.SELF_IMPROVE_ALLOWED_REPOS || '';
+const SI_ALLOWED      = SI_ALLOWED_RAW.split(',').map(r => r.trim()).filter(Boolean);
+const SI_BRANCH_PFX   = process.env.SELF_IMPROVE_BRANCH_PREFIX || 'autofix/';
+const GITHUB_TOKEN    = process.env.GITHUB_TOKEN || '';
+const SI_DISPATCH_SEC = process.env.SELF_IMPROVE_DISPATCH_SECRET || '';
+
+function getSIPolicy() {
+  const blockers = [];
+  if (SI_MODE !== 'on') blockers.push('SELF_IMPROVE_MODE');
+  if (SI_ALLOWED.length === 0) blockers.push('SELF_IMPROVE_ALLOWED_REPOS');
+  return {
+    mode: SI_MODE,
+    write_policy: blockers.length === 0 ? 'allowed' : 'blocked',
+    policy_blockers: blockers,
+    repos_configured: SI_ALLOWED.length > 0,
+    repos: SI_ALLOWED,
+    branch_prefix: SI_BRANCH_PFX,
+    token_present: GITHUB_TOKEN.length > 0,
+    dispatch_secret_required: SI_DISPATCH_SEC.length > 0
+  };
+}
+
+// GitHub API helper — get file SHA then push content to autofix branch
+function githubRequest(method, apiPath, body, token) {
+  return new Promise((resolve, reject) => {
+    const data = body ? JSON.stringify(body) : null;
+    const opts = {
+      hostname: 'api.github.com',
+      path: apiPath,
+      method,
+      headers: {
+        'User-Agent': 'hermes-agent/0.15.0',
+        'Authorization': `Bearer ${token}`,
+        'Accept': 'application/vnd.github+json',
+        'X-GitHub-Api-Version': '2022-11-28',
+        ...(data ? { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(data) } : {})
+      }
+    };
+    const req = https.request(opts, (res) => {
+      let buf = '';
+      res.on('data', d => { buf += d; });
+      res.on('end', () => {
+        try { resolve({ status: res.statusCode, body: JSON.parse(buf) }); }
+        catch { resolve({ status: res.statusCode, body: buf }); }
+      });
+    });
+    req.on('error', reject);
+    if (data) req.write(data);
+    req.end();
+  });
+}
+
+async function siPushFile({ repo, filePath, content, message, baseBranch }) {
+  const branch = SI_BRANCH_PFX + 'patch-' + Date.now();
+  const [owner, repoName] = repo.split('/');
+
+  // 1. Get default branch HEAD sha
+  const base = baseBranch || 'main';
+  const refRes = await githubRequest('GET', `/repos/${owner}/${repoName}/git/ref/heads/${base}`, null, GITHUB_TOKEN);
+  if (refRes.status !== 200) throw new Error(`Could not get ref for ${base}: ${refRes.status}`);
+  const baseSha = refRes.body.object.sha;
+
+  // 2. Create autofix branch
+  await githubRequest('POST', `/repos/${owner}/${repoName}/git/refs`, {
+    ref: `refs/heads/${branch}`,
+    sha: baseSha
+  }, GITHUB_TOKEN);
+
+  // 3. Get existing file SHA if it exists (needed for update)
+  let existingSha;
+  const fileRes = await githubRequest('GET', `/repos/${owner}/${repoName}/contents/${filePath}?ref=${branch}`, null, GITHUB_TOKEN);
+  if (fileRes.status === 200) existingSha = fileRes.body.sha;
+
+  // 4. Push file
+  const pushBody = {
+    message: message || `self-improve: update ${filePath}`,
+    content: Buffer.from(content).toString('base64'),
+    branch
+  };
+  if (existingSha) pushBody.sha = existingSha;
+
+  const pushRes = await githubRequest('PUT', `/repos/${owner}/${repoName}/contents/${filePath}`, pushBody, GITHUB_TOKEN);
+  if (pushRes.status !== 200 && pushRes.status !== 201) {
+    throw new Error(`Push failed: ${pushRes.status} ${JSON.stringify(pushRes.body)}`);
+  }
+
+  return { branch, repo, file: filePath, commit: pushRes.body.commit?.sha };
+}
 
 // ── Persistent session store ─────────────────────────────────────
 let sessions = new Map();
@@ -53,11 +145,8 @@ function runDeploySetupOnce() {
     child.stdout.on('data', (d) => process.stdout.write(`[setup] ${d}`));
     child.stderr.on('data', (d) => process.stderr.write(`[setup] ${d}`));
     child.on('close', (code) => {
-      if (code === 0) {
-        console.log('[setup] Deployment bootstrap completed');
-      } else {
-        console.warn(`[setup] Deployment bootstrap exited with code ${code}`);
-      }
+      if (code === 0) console.log('[setup] Deployment bootstrap completed');
+      else console.warn(`[setup] Deployment bootstrap exited with code ${code}`);
     });
   } catch (e) {
     console.warn('[setup] Failed to launch deployment bootstrap:', e.message);
@@ -66,36 +155,32 @@ function runDeploySetupOnce() {
 
 runDeploySetupOnce();
 
-// Clean up sessions older than 7 days, save every 5 min
 setInterval(() => {
   const cut = Date.now() - 7 * 24 * 3600000;
   for (const [k, v] of sessions) if (v.t < cut) sessions.delete(k);
   saveSessions();
 }, 5 * 60 * 1000);
 
-// ── Sliding context window (hindsight observation-default) ───────
+// ── Sliding context window ───────────────────────────────────────
 function buildContextHistory(sessionHistory) {
   const KEEP_RECENT = 20;
   if (sessionHistory.length <= KEEP_RECENT) return sessionHistory;
   const older = sessionHistory.slice(0, sessionHistory.length - KEEP_RECENT);
   const recent = sessionHistory.slice(-KEEP_RECENT);
   const summaryLines = older.map(m => `${m.role}: ${m.content.slice(0, 150)}`).join('\n');
-  const summaryMsg = {
-    role: 'system',
-    content: `[Earlier conversation summary]\n${summaryLines}\n[End summary — full recent messages follow]`
-  };
-  return [summaryMsg, ...recent];
+  return [
+    { role: 'system', content: `[Earlier conversation summary]\n${summaryLines}\n[End summary — full recent messages follow]` },
+    ...recent
+  ];
 }
 
 // ── CORS helper ──────────────────────────────────────────────────
 function cors(res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,DELETE,OPTIONS');
-  // v0.15.0: added x-model to allowed headers
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Authorization,x-ic-url,x-session-id,x-session-name,x-model');
 }
 
-// v0.15.0: web-URL redaction — strip tokens from stderr logs
 function redactUrl(s) {
   return s.replace(/https?:\/\/[^\s"']*/g, (u) => {
     try { return new URL(u).hostname; } catch { return '[url]'; }
@@ -113,7 +198,6 @@ function jsonReply(content, model) {
   });
 }
 
-// v0.15.0: unified /models picker
 const HERMES_MODELS = [
   'hermes-agent',
   'nous-hermes-2-mixtral-8x7b',
@@ -129,29 +213,100 @@ const server = http.createServer((req, res) => {
 
   const url = req.url.split('?')[0];
 
-  // Health / session list — v0.15.0: /status alias added
+  // Health
   if (req.method === 'GET' && (url === '/' || url === '/health' || url === '/status')) {
     const sessionList = [];
-    for (const [k, v] of sessions) {
+    for (const [k, v] of sessions)
       sessionList.push({ id: k, name: v.name || k, messages: v.h.length, last: new Date(v.t).toISOString() });
-    }
     res.writeHead(200, { 'Content-Type': 'application/json' });
     return res.end(JSON.stringify({ status: 'ok', service: 'hermes-agent', version: '0.15.0', sessions: sessionList }));
   }
 
-  // v0.15.0: unified /models endpoint
+  // Models
   if (req.method === 'GET' && url === '/models') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     return res.end(JSON.stringify({ object: 'list', data: HERMES_MODELS.map(id => ({ id, object: 'model' })) }));
   }
 
-  // Clear a specific session
+  // ── Self-Improve: policy diagnostic ─────────────────────────────
+  if (req.method === 'GET' && url === '/self-improve/policy') {
+    const policy = getSIPolicy();
+    // Check GitHub API reachability
+    githubRequest('GET', '/user', null, GITHUB_TOKEN)
+      .then(r => {
+        policy.api_reachable = r.status === 200;
+        policy.api_user = r.status === 200 ? r.body.login : null;
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(policy));
+      })
+      .catch(() => {
+        policy.api_reachable = false;
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(policy));
+      });
+    return;
+  }
+
+  // ── Self-Improve: push a file to autofix/* branch ────────────────
+  if (req.method === 'POST' && url === '/self-improve') {
+    let body = '';
+    req.on('data', d => { body += d; });
+    req.on('end', async () => {
+      // Policy gate
+      const policy = getSIPolicy();
+      if (policy.write_policy !== 'allowed') {
+        res.writeHead(403, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ error: 'Write policy blocked', blockers: policy.policy_blockers }));
+      }
+      if (!GITHUB_TOKEN) {
+        res.writeHead(403, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ error: 'GITHUB_TOKEN not set' }));
+      }
+
+      let payload;
+      try { payload = JSON.parse(body); }
+      catch {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ error: 'Invalid JSON' }));
+      }
+
+      const { file, content, message, repo, base_branch } = payload;
+      if (!file || !content) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ error: 'file and content are required' }));
+      }
+
+      // Repo must be in allowed list
+      const targetRepo = repo || SI_ALLOWED[0];
+      if (!SI_ALLOWED.includes(targetRepo)) {
+        res.writeHead(403, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ error: `Repo ${targetRepo} not in SELF_IMPROVE_ALLOWED_REPOS` }));
+      }
+
+      try {
+        const result = await siPushFile({
+          repo: targetRepo,
+          filePath: file,
+          content,
+          message,
+          baseBranch: base_branch || 'main'
+        });
+        console.log(`[self-improve] Pushed ${file} to ${result.branch} on ${targetRepo}`);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, ...result }));
+      } catch (e) {
+        console.error('[self-improve] Push failed:', e.message);
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: e.message }));
+      }
+    });
+    return;
+  }
+
+  // Delete session
   if (req.method === 'DELETE' && url === '/session') {
     const sid = req.headers['x-session-id'];
-    if (sid && sessions.has(sid)) {
-      sessions.delete(sid);
-      saveSessions();
-    }
+    if (sid && sessions.has(sid)) { sessions.delete(sid); saveSessions(); }
     res.writeHead(200, { 'Content-Type': 'application/json' });
     return res.end(JSON.stringify({ ok: true }));
   }
@@ -168,8 +323,7 @@ const server = http.createServer((req, res) => {
         return res.end(JSON.stringify({ error: 'Invalid JSON' }));
       }
 
-      const incomingMessages = payload.messages || [];
-      const userMsgs = incomingMessages.filter(m => m.role === 'user');
+      const userMsgs = (payload.messages || []).filter(m => m.role === 'user');
       const last = userMsgs[userMsgs.length - 1];
       if (!last) {
         res.writeHead(400, { 'Content-Type': 'application/json' });
@@ -180,11 +334,9 @@ const server = http.createServer((req, res) => {
         ? last.content
         : (last.content || []).map(c => c.text || '').join(' ');
 
-      // v0.15.0: /yolo session bypass — skips history read/write entirely
       const sid = req.headers['x-session-id'] || 'default';
       const yolo = sid === 'yolo';
       const sessionName = req.headers['x-session-name'] || sid;
-      // v0.15.0: x-model header takes precedence over payload model
       const model = req.headers['x-model'] || payload.model || 'hermes-agent';
 
       let sess;
@@ -201,24 +353,20 @@ const server = http.createServer((req, res) => {
       }
 
       const contextHistory = buildContextHistory(sess.h);
-      console.log(`[memory] Session ${sid}: ${sess.h.length} stored messages, sending ${contextHistory.length} in context`);
+      console.log(`[memory] Session ${sid}: ${sess.h.length} stored, ${contextHistory.length} in context`);
 
       const histFile = path.join(os.tmpdir(), 'hist_' + Date.now() + '.json');
-      const outFile = path.join(os.tmpdir(), 'out_' + Date.now() + '_' + Math.random().toString(36).slice(2) + '.txt');
+      const outFile  = path.join(os.tmpdir(), 'out_'  + Date.now() + '_' + Math.random().toString(36).slice(2) + '.txt');
 
-      try {
-        fs.writeFileSync(histFile, JSON.stringify(contextHistory));
-      } catch (e) {
+      try { fs.writeFileSync(histFile, JSON.stringify(contextHistory)); } catch (e) {
         console.error('[memory] Failed to write hist file:', e.message);
       }
 
       const runner = process.env.HERMES_RUNNER || '/data/.hermes/hermes-agent/hermes_runner.py';
-      const cwd = process.env.HERMES_DIR || '/data/.hermes/hermes-agent';
+      const cwd    = process.env.HERMES_DIR    || '/data/.hermes/hermes-agent';
 
-      // v0.15.0: MCP bare-command PATH resolution — shell:false, inherit PATH as-is
       const child = spawn('python3', [runner, outFile, prompt, '--history', histFile], {
-        cwd,
-        shell: false,
+        cwd, shell: false,
         env: { ...process.env, HERMES_QUIET: '1', HOME: '/data', PYTHONUNBUFFERED: '1' }
       });
 
@@ -230,14 +378,11 @@ const server = http.createServer((req, res) => {
 
       const timer = setTimeout(() => {
         clearInterval(ka);
-        // v0.15.0: kanban worker SIGTERM + 2s grace before SIGKILL
         child.kill('SIGTERM');
         setTimeout(() => { try { child.kill('SIGKILL'); } catch {} }, 2000);
         if (res.writableEnded) return;
         let text = 'Timed out after 5 minutes.';
-        try {
-          if (fs.existsSync(outFile)) { text = fs.readFileSync(outFile, 'utf8').trim() || text; }
-        } catch {}
+        try { if (fs.existsSync(outFile)) text = fs.readFileSync(outFile, 'utf8').trim() || text; } catch {}
         try { fs.unlinkSync(outFile); } catch {}
         try { fs.unlinkSync(histFile); } catch {}
         res.end(jsonReply(text, model));
@@ -249,20 +394,17 @@ const server = http.createServer((req, res) => {
         if (res.writableEnded) return;
 
         let text = '';
-        try {
-          if (fs.existsSync(outFile)) { text = fs.readFileSync(outFile, 'utf8').trim(); }
-        } catch {}
+        try { if (fs.existsSync(outFile)) text = fs.readFileSync(outFile, 'utf8').trim(); } catch {}
         try { fs.unlinkSync(outFile); } catch {}
         try { fs.unlinkSync(histFile); } catch {}
 
         if (!text) {
-          // v0.15.0: redact URLs from stderr before logging
           text = stderr ? 'Error: ' + stderr.slice(0, 600) : '(no response)';
           if (stderr) console.error('[hermes] stderr:', redactUrl(stderr.slice(0, 400)));
         }
 
         if (!yolo) {
-          sess.h.push({ role: 'user', content: prompt });
+          sess.h.push({ role: 'user',      content: prompt });
           sess.h.push({ role: 'assistant', content: text });
           if (sess.h.length > 100) sess.h = sess.h.slice(-100);
           saveSessions();
@@ -281,7 +423,9 @@ const server = http.createServer((req, res) => {
 
 server.timeout = 360000;
 server.listen(PORT, LISTEN_HOST, () => {
+  const policy = getSIPolicy();
   console.log(`Hermes gateway v0.15.0 on ${LISTEN_HOST}:${PORT}`);
   console.log(`Sessions file: ${SESSIONS_FILE}`);
-  console.log(`Insecure bind: ${process.env.HERMES_INSECURE === '1' ? 'YES (HERMES_INSECURE=1)' : 'no'}`);
+  console.log(`Self-improve: mode=${SI_MODE} | policy=${policy.write_policy} | repos=${SI_ALLOWED.join(',') || 'none'}`);
+  console.log(`Insecure bind: ${process.env.HERMES_INSECURE === '1' ? 'YES' : 'no'}`);
 });
