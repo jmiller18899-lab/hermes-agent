@@ -11,13 +11,104 @@ const DATA_DIR = process.env.HERMES_HOME || '/data';
 const SESSIONS_FILE = path.join(DATA_DIR, 'sessions.json');
 const AUTO_SETUP_ON_DEPLOY = (process.env.HERMES_AUTO_SETUP_ON_DEPLOY || '1') !== '0';
 
-// v0.15.0: explicit HERMES_INSECURE opt-in for 0.0.0.0 bind — no inference
 const LISTEN_HOST = process.env.RAILWAY_ENVIRONMENT || process.env.RENDER || process.env.FLY_APP_NAME
   ? '0.0.0.0'
   : (process.env.HERMES_INSECURE === '1' ? '0.0.0.0' : '127.0.0.1');
 
+// ── ntfy notification helper ─────────────────────────────────────
+const NTFY_TOPIC = process.env.NTFY_TOPIC || 'hermes_private_9922';
+const NTFY_BASE  = process.env.NTFY_BASE  || 'https://ntfy.sh';
+
+function ntfyNotify(title, message, priority) {
+  try {
+    const body = Buffer.from(message || '');
+    const opts = {
+      hostname: new URL(NTFY_BASE).hostname,
+      path: '/' + NTFY_TOPIC,
+      method: 'POST',
+      headers: {
+        'Title': title,
+        'Priority': priority || 'default',
+        'Content-Type': 'text/plain',
+        'Content-Length': body.length
+      }
+    };
+    const req = https.request(opts);
+    req.on('error', () => {});
+    req.write(body);
+    req.end();
+  } catch (_) {}
+}
+
+// ── Telemetry store ──────────────────────────────────────────────
+const telemetry = {
+  tasks_started:   0,
+  tasks_completed: 0,
+  tasks_failed:    0,
+  tasks_timed_out: 0,
+  total_tokens:    0,
+  uptime_start:    Date.now()
+};
+
+// ── Task tracker ─────────────────────────────────────────────────
+// task_id -> { id, status, prompt_preview, session_id, started, finished, error }
+const taskMap = new Map();
+const MAX_TASKS = 200; // keep last 200 tasks in memory
+
+function createTask(sessionId, promptPreview) {
+  const id = 'task_' + Date.now() + '_' + Math.random().toString(36).slice(2, 7);
+  const task = {
+    id,
+    status: 'running',
+    session_id: sessionId,
+    prompt_preview: (promptPreview || '').slice(0, 120),
+    started: Date.now(),
+    finished: null,
+    error: null
+  };
+  taskMap.set(id, task);
+  telemetry.tasks_started++;
+  // Prune oldest if over limit
+  if (taskMap.size > MAX_TASKS) {
+    const oldest = taskMap.keys().next().value;
+    taskMap.delete(oldest);
+  }
+  return task;
+}
+
+function completeTask(task, success, errorMsg) {
+  task.finished = Date.now();
+  task.duration_ms = task.finished - task.started;
+  if (success) {
+    task.status = 'completed';
+    telemetry.tasks_completed++;
+    ntfyNotify(
+      '✅ Hermes Task Done',
+      `Session: ${task.session_id}\nDuration: ${(task.duration_ms / 1000).toFixed(1)}s\nPrompt: ${task.prompt_preview}`,
+      'default'
+    );
+  } else {
+    task.status = task.status === 'timeout' ? 'timeout' : 'failed';
+    task.error = errorMsg || 'Unknown error';
+    if (task.status === 'timeout') {
+      telemetry.tasks_timed_out++;
+      ntfyNotify(
+        '⏱️ Hermes Task Timed Out',
+        `Session: ${task.session_id}\nPrompt: ${task.prompt_preview}`,
+        'high'
+      );
+    } else {
+      telemetry.tasks_failed++;
+      ntfyNotify(
+        '❌ Hermes Task Failed',
+        `Session: ${task.session_id}\nError: ${(errorMsg || '').slice(0, 200)}\nPrompt: ${task.prompt_preview}`,
+        'high'
+      );
+    }
+  }
+}
+
 // ── Python binary resolution ─────────────────────────────────────
-// Prefer PYTHON_BIN env var, then try common paths, then fall back to 'python3'
 function resolvePythonBin() {
   const candidates = [
     process.env.PYTHON_BIN,
@@ -26,18 +117,15 @@ function resolvePythonBin() {
     '/opt/homebrew/bin/python3',
     'python3',
   ].filter(Boolean);
-
   for (const candidate of candidates) {
     try {
       execFileSync(candidate, ['--version'], { stdio: 'pipe' });
       console.log(`[python] Resolved python binary: ${candidate}`);
       return candidate;
-    } catch (_) {
-      // not found, try next
-    }
+    } catch (_) {}
   }
   console.warn('[python] Warning: no python3 binary found in any candidate path');
-  return 'python3'; // last resort
+  return 'python3';
 }
 
 const PYTHON_BIN = resolvePythonBin();
@@ -49,8 +137,6 @@ const SI_ALLOWED     = SI_ALLOWED_RAW.split(',').map(r => r.trim()).filter(Boole
 const SI_BRANCH_PFX  = process.env.SELF_IMPROVE_BRANCH_PREFIX || 'autofix/';
 const GITHUB_TOKEN   = process.env.GITHUB_TOKEN || '';
 const SI_DISPATCH_SEC = process.env.SELF_IMPROVE_DISPATCH_SECRET || '';
-
-// Valid modes: off (blocked), propose (create PR), autopr (alias), on (direct push)
 const SI_VALID_MODES = ['on', 'propose', 'autopr'];
 
 function getSIPolicy() {
@@ -78,7 +164,7 @@ function githubRequest(method, apiPath, body, token) {
       path: apiPath,
       method,
       headers: {
-        'User-Agent': 'hermes-agent/0.15.0',
+        'User-Agent': 'hermes-agent/0.16.0',
         'Authorization': `Bearer ${token}`,
         'Accept': 'application/vnd.github+json',
         'X-GitHub-Api-Version': '2022-11-28',
@@ -103,30 +189,24 @@ async function siPushFile({ repo, filePath, content, message, baseBranch }) {
   const branch = SI_BRANCH_PFX + 'patch-' + Date.now();
   const [owner, repoName] = repo.split('/');
   const base = baseBranch || 'main';
-
   const refRes = await githubRequest('GET', `/repos/${owner}/${repoName}/git/ref/heads/${base}`, null, GITHUB_TOKEN);
   if (refRes.status !== 200) throw new Error(`Could not get ref for ${base}: ${refRes.status}`);
   const baseSha = refRes.body.object.sha;
-
   await githubRequest('POST', `/repos/${owner}/${repoName}/git/refs`, {
     ref: `refs/heads/${branch}`, sha: baseSha
   }, GITHUB_TOKEN);
-
   let existingSha;
   const fileRes = await githubRequest('GET', `/repos/${owner}/${repoName}/contents/${filePath}?ref=${branch}`, null, GITHUB_TOKEN);
   if (fileRes.status === 200) existingSha = fileRes.body.sha;
-
   const pushBody = {
     message: message || `self-improve: update ${filePath}`,
     content: Buffer.from(content).toString('base64'),
     branch
   };
   if (existingSha) pushBody.sha = existingSha;
-
   const pushRes = await githubRequest('PUT', `/repos/${owner}/${repoName}/contents/${filePath}`, pushBody, GITHUB_TOKEN);
   if (pushRes.status !== 200 && pushRes.status !== 201)
     throw new Error(`Push failed: ${pushRes.status} ${JSON.stringify(pushRes.body)}`);
-
   let pr = null;
   if (SI_MODE === 'propose' || SI_MODE === 'autopr') {
     const prRes = await githubRequest('POST', `/repos/${owner}/${repoName}/pulls`, {
@@ -136,7 +216,6 @@ async function siPushFile({ repo, filePath, content, message, baseBranch }) {
     }, GITHUB_TOKEN);
     if (prRes.status === 201) pr = { number: prRes.body.number, url: prRes.body.html_url };
   }
-
   return { branch, repo, file: filePath, commit: pushRes.body.commit?.sha, pr };
 }
 
@@ -175,12 +254,9 @@ function runDeploySetupOnce() {
       env: { ...process.env, HERMES_HOME: DATA_DIR, HOME: DATA_DIR, HERMES_QUIET: '1' },
       stdio: 'pipe'
     });
-    // ❗ Critical: handle spawn errors (e.g. ENOENT if hermes not on PATH)
-    // Without this handler Node throws an unhandled error and crashes the process
     child.on('error', (e) => {
       if (e.code === 'ENOENT') {
         console.warn('[setup] hermes binary not found on PATH — skipping deploy bootstrap');
-        console.warn('[setup] Set HERMES_AUTO_SETUP_ON_DEPLOY=0 to suppress this warning');
       } else {
         console.warn('[setup] Deploy bootstrap spawn error:', e.message);
       }
@@ -262,7 +338,54 @@ const server = http.createServer((req, res) => {
     for (const [k, v] of sessions)
       sessionList.push({ id: k, name: v.name || k, messages: v.h.length, last: new Date(v.t).toISOString() });
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    return res.end(JSON.stringify({ status: 'ok', service: 'hermes-agent', version: '0.15.0', python_bin: PYTHON_BIN, sessions: sessionList }));
+    return res.end(JSON.stringify({ status: 'ok', service: 'hermes-agent', version: '0.16.0', python_bin: PYTHON_BIN, sessions: sessionList }));
+  }
+
+  // Stats / telemetry dashboard feed
+  if (req.method === 'GET' && url === '/api/stats') {
+    const running = [];
+    const recent  = [];
+    for (const [, t] of taskMap) {
+      if (t.status === 'running') running.push(t);
+      else recent.push(t);
+    }
+    recent.sort((a, b) => (b.finished || 0) - (a.finished || 0));
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify({
+      telemetry,
+      uptime_seconds: Math.floor((Date.now() - telemetry.uptime_start) / 1000),
+      running_tasks: running,
+      recent_tasks: recent.slice(0, 50),
+      ntfy_topic: NTFY_TOPIC
+    }));
+  }
+
+  // Tasks list
+  if (req.method === 'GET' && url === '/api/tasks') {
+    const tasks = [];
+    for (const [, t] of taskMap) tasks.push(t);
+    tasks.sort((a, b) => b.started - a.started);
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify({ tasks: tasks.slice(0, 100), total: taskMap.size }));
+  }
+
+  // Single task lookup
+  if (req.method === 'GET' && url.startsWith('/api/tasks/')) {
+    const tid = url.replace('/api/tasks/', '');
+    const task = taskMap.get(tid);
+    if (!task) {
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ error: 'Task not found' }));
+    }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify(task));
+  }
+
+  // Manual ntfy test
+  if (req.method === 'POST' && url === '/api/notify/test') {
+    ntfyNotify('🔔 Hermes Test', 'Notification system is working! Agent is alive.', 'default');
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify({ ok: true, topic: NTFY_TOPIC }));
   }
 
   // Models
@@ -292,7 +415,7 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // Self-Improve: push file to autofix/* branch
+  // Self-Improve: push file
   if (req.method === 'POST' && url === '/self-improve') {
     let body = '';
     req.on('data', d => { body += d; });
@@ -344,7 +467,7 @@ const server = http.createServer((req, res) => {
     return res.end(JSON.stringify({ ok: true }));
   }
 
-  // Chat completions
+  // Chat completions ── now with task lifecycle tracking
   if (req.method === 'POST' && (url === '/v1/chat/completions' || url === '/api/chat')) {
     let body = '';
     req.on('data', d => body += d);
@@ -370,6 +493,10 @@ const server = http.createServer((req, res) => {
       const sessionName = req.headers['x-session-name'] || sid;
       const model = req.headers['x-model'] || payload.model || 'hermes-agent';
 
+      // ── Create task record ────────────────────────────────────
+      const task = createTask(sid, prompt);
+      console.log(`[task] ${task.id} started | session=${sid} | prompt="${task.prompt_preview}"`);
+
       let sess;
       if (yolo) {
         sess = { h: [], t: Date.now(), name: 'yolo' };
@@ -384,8 +511,6 @@ const server = http.createServer((req, res) => {
       }
 
       const contextHistory = buildContextHistory(sess.h);
-      console.log(`[memory] Session ${sid}: ${sess.h.length} stored, ${contextHistory.length} in context`);
-
       const histFile = path.join(os.tmpdir(), 'hist_' + Date.now() + '.json');
       const outFile  = path.join(os.tmpdir(), 'out_'  + Date.now() + '_' + Math.random().toString(36).slice(2) + '.txt');
 
@@ -396,16 +521,16 @@ const server = http.createServer((req, res) => {
       const runner = process.env.HERMES_RUNNER || '/data/.hermes/hermes-agent/hermes_runner.py';
       const cwd    = process.env.HERMES_DIR    || '/data/.hermes/hermes-agent';
 
-      // Use resolved PYTHON_BIN instead of hardcoded 'python3'
       const child = spawn(PYTHON_BIN, [runner, outFile, prompt, '--history', histFile], {
         cwd, shell: false,
         env: { ...process.env, HERMES_QUIET: '1', HOME: '/data', PYTHONUNBUFFERED: '1', PYTHON_BIN }
       });
 
-      // Handle spawn errors gracefully (e.g. python3 not found)
       child.on('error', (e) => {
         clearTimeout(timer);
         clearInterval(ka);
+        completeTask(task, false, `Spawn error: ${e.message}`);
+        console.error(`[task] ${task.id} spawn error: ${e.message}`);
         if (!res.writableEnded) res.end(jsonReply(`Spawn error: ${e.message}`, model));
       });
 
@@ -419,6 +544,9 @@ const server = http.createServer((req, res) => {
         clearInterval(ka);
         child.kill('SIGTERM');
         setTimeout(() => { try { child.kill('SIGKILL'); } catch {} }, 2000);
+        task.status = 'timeout';
+        completeTask(task, false, 'Timed out after 5 minutes');
+        console.warn(`[task] ${task.id} TIMED OUT`);
         if (res.writableEnded) return;
         let text = 'Timed out after 5 minutes.';
         try { if (fs.existsSync(outFile)) text = fs.readFileSync(outFile, 'utf8').trim() || text; } catch {}
@@ -437,14 +565,17 @@ const server = http.createServer((req, res) => {
         try { fs.unlinkSync(histFile); } catch {}
         if (!text) {
           text = stderr ? 'Error: ' + stderr.slice(0, 600) : '(no response)';
-          if (stderr) console.error('[hermes] stderr:', redactUrl(stderr.slice(0, 400)));
+          completeTask(task, false, stderr ? stderr.slice(0, 300) : 'No response from runner');
+          console.error(`[task] ${task.id} failed | stderr: ${redactUrl(stderr.slice(0, 200))}`);
+        } else {
+          completeTask(task, true);
+          console.log(`[task] ${task.id} completed in ${task.duration_ms}ms`);
         }
         if (!yolo) {
           sess.h.push({ role: 'user',      content: prompt });
           sess.h.push({ role: 'assistant', content: text });
           if (sess.h.length > 100) sess.h = sess.h.slice(-100);
           saveSessions();
-          console.log(`[memory] Session ${sid} now has ${sess.h.length} messages`);
         }
         res.end(jsonReply(text, model));
       });
@@ -459,9 +590,10 @@ const server = http.createServer((req, res) => {
 server.timeout = 360000;
 server.listen(PORT, LISTEN_HOST, () => {
   const policy = getSIPolicy();
-  console.log(`Hermes gateway v0.15.0 on ${LISTEN_HOST}:${PORT}`);
+  console.log(`Hermes gateway v0.16.0 on ${LISTEN_HOST}:${PORT}`);
   console.log(`Python binary: ${PYTHON_BIN}`);
   console.log(`Sessions file: ${SESSIONS_FILE}`);
   console.log(`Self-improve: mode=${SI_MODE} | policy=${policy.write_policy} | repos=${SI_ALLOWED.join(',') || 'none'}`);
-  console.log(`Insecure bind: ${process.env.HERMES_INSECURE === '1' ? 'YES' : 'no'}`);
+  console.log(`Notifications: ntfy topic=${NTFY_TOPIC}`);
+  ntfyNotify('🚀 Hermes Online', `Gateway v0.16.0 started. Notifications active on topic: ${NTFY_TOPIC}`, 'low');
 });
